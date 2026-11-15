@@ -1,30 +1,34 @@
-# Willys Halmstad Öster · Streamlit
+# Food Sale · Willys Halmstad Öster
 
-One Python application file with live, publicly available store offers. Includes a visible Ljust/Mörkt appearance selector, search, member filters, prices, multi-buy conditions, purchase limits, and validity dates. All results pages are fetched and checked. Personal coupons are excluded. Refreshes every 30 minutes while a browser session is active; shared data cache lasts five minutes. The refresh button clears the cache.
+One Python application file displaying current public offers from Willys Halmstad Öster, Laholmsvägen 37. No Willys login is required. Personal coupons are excluded.
 
-## Run locally
+- Light/dark appearance, retained in the URL across reloads.
+- Overview of active offers, Willys Plus deals, and offers ending today.
+- Search across products, brands, sizes, and descriptions; accents and word order are handled.
+- Membership and expiry filters, plus expiry/name sorting.
+- Product images, multi-buy wording, units, purchase limits, and validity dates.
+- All results pages are checked. Cached prices are rechecked for date validity before display.
+- Shared five-minute data cache; refresh button; automatic updates every 30 minutes while the session is active. Cache does not persist across server restarts.
 
-Use Python 3.15 (the version tested), or a compatible Python version supported by Streamlit. In this folder run:
+## Run
+
+From this repository, with a Python version supported by Streamlit:
 
 ```sh
-python3 -m pip install -r requirements.txt
-python3 -m streamlit run app.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
 ```
 
-Stop with Ctrl+C in the terminal. Internet access is required. No Willys login is needed. Image requests go to Willys' image providers.
+Python 3.15 and Streamlit 1.67.0 were used for local verification. Internet access is required. Stop with Ctrl+C. Images are requested from Willys' image providers.
 
-## Publish on Streamlit Community Cloud
+## Streamlit Community Cloud
 
-1. Put this folder's contents in the root of a GitHub repository, including `.streamlit/config.toml`.
-2. Sign into https://share.streamlit.io and connect that repository.
-3. Create an app, select the repository and branch, and set the entrypoint to `app.py`.
-4. Select Python 3.15 if offered. Otherwise use a supported Python version compatible with the pinned dependencies and verify deployment.
-5. Deploy and open the assigned link. Confirm offers load from the hosting environment before sharing it.
+Push `app.py`, `requirements.txt`, and `.streamlit/config.toml` to GitHub. Keep the config in that subdirectory: a root-level `config.toml` is not loaded by Streamlit. In Community Cloud choose the repository, branch, and `app.py` entrypoint. Select a compatible Python version and deploy. Verify that offers load from the hosting environment before sharing its URL.
 
-The app has been tested locally against Willys with 257 current offers, including search and member filtering. It has not yet been deployed to Community Cloud. Willys may change its undocumented website data endpoints or restrict access from hosting providers; that requires retesting or updates.
+The Willys website endpoints are undocumented and may change or restrict cloud access. Local testing does not establish hosted reliability. This is an independent offers viewer.
 
-Official deployment documentation: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app
+## Verification
 
-## Appearance
-
-Use Ljust (light) or Mörkt (dark) at the top of the page. Each visitor has their own choice. The URL preserves the selected mode across reloads. Both modes and reload persistence were verified in a browser.
+The improvement pass checked 257 live offers, membership and expiry filtering, accent/multiword search, sorting, empty results, expired records, escaped HTML, incomplete source responses, and network failures. Browser checks covered light/dark appearance, search, expiry filtering, theme persistence, and a 390-pixel phone layout. No deployment or performance improvement is claimed from those checks.
