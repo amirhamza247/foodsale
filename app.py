@@ -9,6 +9,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unicodedata
+import re
+from decimal import Decimal, InvalidOperation
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 import streamlit as st
 
@@ -30,6 +34,40 @@ def get_json(path, params=None):
     return value
 
 
+
+def require_mapping(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(f'Unexpected {label} format from Willys.')
+    return value
+
+
+def validate_product(product):
+    product = require_mapping(product, 'product')
+    for field in ('name', 'manufacturer', 'displayVolume', 'price', 'priceUnit'):
+        if product.get(field) is not None and not isinstance(product[field], str):
+            raise ValueError(f'Unexpected product {field} format from Willys.')
+    for field in ('image', 'thumbnail'):
+        image = product.get(field)
+        if image is not None:
+            require_mapping(image, 'image')
+            if image.get('url') is not None and not isinstance(image['url'], str):
+                raise ValueError('Unexpected image URL format from Willys.')
+    promotions = product.get('potentialPromotions')
+    if promotions is None:
+        return []
+    if not isinstance(promotions, list):
+        raise ValueError('Unexpected promotions format from Willys.')
+    for promotion in promotions:
+        require_mapping(promotion, 'promotion')
+        for field in ('startDate', 'endDate', 'code', 'name', 'rewardLabel', 'cartLabel',
+                      'conditionLabel', 'description', 'campaignType', 'weightVolume',
+                      'textLabelManual', 'textLabel', 'textLabelGenerated',
+                      'splashTitleText', 'redeemLimitLabel', 'comparePrice'):
+            if promotion.get(field) is not None and not isinstance(promotion[field], str):
+                raise ValueError(f'Unexpected promotion {field} format from Willys.')
+    return promotions
+
+@lru_cache(maxsize=512)
 def parse_date(value):
     if not value:
         return None
@@ -43,11 +81,65 @@ def clean_text(value):
     return str(value).strip() if value is not None else ''
 
 
+
+def price_amount(value):
+    """Accept a single Swedish amount, never ranges, percentages, or bundle text."""
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).replace(' ', '').replace('\xa0', '')
+    if not re.fullmatch(r'\d+(?:[.,:]\d{1,2})?', text):
+        return None
+    try:
+        return Decimal(text.replace(',', '.').replace(':', '.'))
+    except InvalidOperation:
+        return None
+
+
+def discount_details(product, promotion):
+    """Compare against the displayed ordinary price on the same priced unit.
+
+    Grouped varieties may have different prices; this is a calculation for the
+    source's displayed example, not a promise of identical savings on all variants.
+    """
+    ordinary = price_amount(product.get('priceNoUnit'))
+    unit_match = re.fullmatch(r'kr/(st|kg|l)', clean_text(product.get('priceUnit')))
+    if not unit_match or ordinary is None or ordinary <= 0:
+        return dict(discount_percent=None, saving=None, saving_unit='')
+    unit = unit_match.group(1)
+    # Numeric fields cannot override explicit contradictory display units.
+    labels = ' '.join(clean_text(promotion.get(k)) for k in ('rewardLabel', 'cartLabel'))
+    displayed_units = re.findall(r'/\s*([a-zåäö]+)', labels.casefold())
+    if any(display_unit != unit for display_unit in displayed_units) or '%' in labels:
+        return dict(discount_percent=None, saving=None, saving_unit=unit)
+    amount = price_amount(promotion.get('price'))
+    condition = clean_text(promotion.get('conditionLabel'))
+    quantity = price_amount(promotion.get('qualifyingCount'))
+    if condition:
+        bundle = re.fullmatch(r'(\d+)\s+för', condition)
+        if not bundle or quantity is None or quantity <= 0 or quantity != Decimal(bundle.group(1)) or unit != 'st':
+            amount = None
+        elif amount is not None and quantity > 0:
+            amount /= quantity
+    elif quantity is not None and quantity != 1:
+        amount = None
+    # Weight-based offers often have no numeric promotion price.
+    if amount is None and not condition:
+        label = clean_text(promotion.get('rewardLabel'))
+        match = re.fullmatch(r'(\d+(?:[.,:]\d{1,2})?)/(st|kg|l)(?:\s*\+pant)?', label)
+        if match and match.group(2) == unit:
+            amount = price_amount(match.group(1))
+    if amount is None or amount < 0:
+        return dict(discount_percent=None, saving=None, saving_unit=unit)
+    saving = max(Decimal(0), ordinary - amount)
+    return dict(discount_percent=float(saving / ordinary * 100), saving=float(saving), saving_unit=unit)
+
 def normalize(results, today):
+    if not isinstance(results, list):
+        raise ValueError('Unexpected results format from Willys.')
     offers = []
     seen = set()
     for product in results:
-        for promo in product.get('potentialPromotions') or []:
+        for promo in validate_product(product):
             start, end = parse_date(promo.get('startDate')), parse_date(promo.get('endDate'))
             # Do not silently present undated promotions as verified current deals.
             if not start or not end:
@@ -74,6 +166,14 @@ def normalize(results, today):
                 ordinary += '/' + unit.split('/', 1)[1]
             # Keep multi-buy wording, conditions, units, and eligibility from the source.
             details = []
+            cart_label = clean_text(promo.get('cartLabel'))
+            if cart_label and cart_label != price:
+                # Keep additional wording without repeating the displayed bundle price.
+                extra = cart_label[:-len(price)].strip() if cart_label.endswith(price) else cart_label
+                if extra:
+                    details.append(extra)
+            if promo.get('realMixAndMatch') is True and not any('välj & blanda' in t.casefold() for t in details):
+                details.append('Välj & blanda!')
             for key in ('textLabelManual', 'textLabel',
                         'textLabelGenerated', 'splashTitleText', 'redeemLimitLabel', 'comparePrice'):
                 text = clean_text(promo.get(key))
@@ -86,26 +186,50 @@ def normalize(results, today):
                 price=price, ordinary=ordinary,
                 member=promo.get('campaignType') == 'LOYALTY',
                 eligibility=clean_text(promo.get('campaignType')),
-                conditions=details, start=start.isoformat(), end=end.isoformat()))
+                conditions=details, start=start.isoformat(), end=end.isoformat(),
+                **discount_details(product, promo)))
     return offers
 
 
+@st.cache_data(ttl=86400, max_entries=1, show_spinner=False)
+def store_information():
+    return get_json('/axfood/rest/v2/store/' + STORE)
+
+
 def fetch_offers():
-    store = get_json('/axfood/rest/v2/store/' + STORE)
+    # Store identity and the first offers page are independent; overlap their I/O.
+    params = dict(q=STORE, type='PERSONAL_GENERAL', page=0, size=200)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        store_future = pool.submit(store_information)
+        page_future = pool.submit(get_json, '/axfood/rest/v2/search/campaigns/offline', params)
+        store, first_page = store_future.result(), page_future.result()
+    require_mapping(store, 'store')
+    address = require_mapping(store['address'] if store.get('address') is not None else {}, 'store address')
     if store.get('storeId') != STORE or store.get('name') != 'Willys Halmstad Öster':
         raise ValueError('Store identity could not be confirmed; no offers displayed.')
     results = []
     expected_total = None
+    expected_pages = None
     for page in range(100):
-        data = get_json('/axfood/rest/v2/search/campaigns/offline',
+        data = first_page if page == 0 else get_json('/axfood/rest/v2/search/campaigns/offline',
                         dict(q=STORE, type='PERSONAL_GENERAL', page=page, size=200))
-        batch, pagination = data.get('results'), data.get('pagination') or {}
-        if not isinstance(batch, list) or not isinstance(pagination.get('numberOfPages'), int):
+        require_mapping(data, 'offers response')
+        batch = data.get('results')
+        pagination = require_mapping(data.get('pagination'), 'pagination')
+        pages = pagination.get('numberOfPages')
+        total = pagination.get('totalNumberOfResults')
+        current_page = pagination.get('currentPage')
+        if (not isinstance(batch, list) or type(pages) is not int or not 0 <= pages <= 100
+                or type(total) is not int or total < 0 or type(current_page) is not int
+                or (pages == 0 and (batch or total))):
             raise ValueError('Willys changed the offers response; update this viewer.')
         if pagination.get('currentPage') != page:
             raise ValueError('Willys returned the wrong results page.')
         if expected_total is None:
-            expected_total = pagination.get('totalNumberOfResults')
+            expected_total = total
+            expected_pages = pages
+        elif pages != expected_pages:
+            raise ValueError('Offers changed during retrieval. Please retry in a few minutes.')
         elif pagination.get('totalNumberOfResults') != expected_total:
             raise ValueError('Offers changed during retrieval. Please retry in a few minutes.')
         results.extend(batch)
@@ -116,13 +240,15 @@ def fetch_offers():
     if expected_total != len(results):
         raise ValueError('Incomplete offers response; please retry.')
     now = dt.datetime.now(STOCKHOLM)
-    return dict(store=store['name'], address=store.get('address', {}).get('formattedAddress', ''),
+    return dict(store=store['name'], address=clean_text(address.get('formattedAddress')),
                 source=SOURCE, fetchedAt=now.isoformat(), today=now.date().isoformat(),
                 sourceResults=len(results), offers=normalize(results, now.date()))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_offers(stockholm_day):
+@st.cache_data(ttl=300, max_entries=2, show_spinner=False, refresh_mode="background")
+def cached_offers(stockholm_day, schema_version=3):
+    # Global public-data cache: return a recent snapshot while refreshing after 5 minutes.
+    # Streamlit bounds stale serving to one additional TTL by default.
     # Date key prevents yesterday's cache being reused after midnight.
     return fetch_offers()
 
@@ -162,7 +288,10 @@ def select_offers(offers, query='', mode='Alla erbjudanden', expiry='Alla slutda
         haystack = search_key(' '.join(offer[k] for k in ('name', 'brand', 'description', 'volume')))
         if all(term in haystack for term in terms):
             selected.append(offer)
-    if order == 'Slutar snart':
+    if order in ('Störst prissänkning (%)', 'Störst besparing (kr/enhet)'):
+        metric = 'discount_percent' if order == 'Störst prissänkning (%)' else 'saving'
+        selected.sort(key=lambda o: (o.get(metric) is None, -(o.get(metric) or 0), search_key(o['name'])))
+    elif order == 'Slutar snart':
         selected.sort(key=lambda o: (o['end'], search_key(o['name'])))
     elif order == 'Namn A–Ö':
         selected.sort(key=lambda o: o['name'].casefold().translate(str.maketrans({'å':'{','ä':'|','ö':'}'})))
@@ -176,6 +305,13 @@ def card(offer, today=None):
     membership = '<span class="badge plus">Willys Plus</span>' if offer['member'] else '<span class="badge general">Alla kunder</span>'
     if offer['eligibility'] not in ('LOYALTY', 'GENERAL'):
         membership = '<span class="badge">' + escape(offer['eligibility'] or 'Se villkor') + '</span>'
+    discount = offer.get('discount_percent')
+    saving = offer.get('saving')
+    saving_label = ''
+    if discount is not None and discount > 0 and saving is not None:
+        membership += f'<span class="badge">−{discount:.0f} %</span>'
+        saving_text = f'{saving:.2f}'.replace('.', ',')
+        saving_label = f'<p class="ordinary">Besparing {saving_text} kr/{escape(offer["saving_unit"])}</p>'
     image = ('<img loading="lazy" referrerpolicy="no-referrer" src="' + escape(offer['image']) +
              '" alt="' + escape(offer['name']) + '">') if offer['image'] else '<span>Bild saknas</span>'
     ordinary = '<p class="ordinary">Ordinarie ' + escape(offer['ordinary']) + '</p>' if offer['ordinary'] else ''
@@ -184,7 +320,7 @@ def card(offer, today=None):
     return f'''<article class="offer-card"><div class="badges">{membership}{urgency}</div>
 <div class="offer-picture">{image}</div><div class="offer-brand">{escape(brand)}</div>
 <h2>{escape(offer['name'])}</h2><p class="offer-description">{escape(offer['description'])}</p>
-<div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{ordinary}</div>
+<div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{ordinary}{saving_label}</div>
 <div class="conditions">{conditions}</div><div class="offer-dates">{display_date(offer['start'])} – {display_date(offer['end'])}</div></article>'''
 
 
@@ -266,7 +402,7 @@ def main():
     st.link_button('Se erbjudanden hos Willys ↗', SOURCE)
 
 
-@st.fragment(run_every=1800)
+@st.fragment(run_every=60)
 def offers_view():
     today = dt.datetime.now(STOCKHOLM).date()
     try:
@@ -276,8 +412,13 @@ def offers_view():
         st.error('Erbjudandena kunde inte hämtas. Kontrollera anslutningen eller försök igen. Inga gamla priser visas.')
         if st.button('Försök igen'):
             cached_offers.clear()
-            st.rerun(scope='fragment')
+            st.rerun()
         return
+    fetched_at = dt.datetime.fromisoformat(result['fetchedAt']).astimezone(STOCKHOLM)
+    age_seconds = max(0, (dt.datetime.now(STOCKHOLM) - fetched_at).total_seconds())
+    if age_seconds > 300:
+        st.warning('Visar sparade erbjudanden från ' + fetched_at.strftime('%H:%M') +
+                   '. Hämtar aktuella priser i bakgrunden. Om uppdateringen misslyckas kan priserna ha ändrats.')
     # Cache age and validity are separate: discard expired offers even within a cached response.
     current = select_offers(result['offers'], today=today)
     members = sum(o['member'] for o in current)
@@ -294,19 +435,35 @@ def offers_view():
     with expiry_col:
         expiry = st.selectbox('Giltighet', ['Alla slutdatum', 'Slutar idag', 'Inom 3 dagar'], key='expiry')
     with order_col:
-        order = st.selectbox('Sortera', ['Willys ordning', 'Slutar snart', 'Namn A–Ö'], key='sort')
+        order = st.selectbox('Sortera', ['Willys ordning', 'Störst prissänkning (%)', 'Störst besparing (kr/enhet)', 'Slutar snart', 'Namn A–Ö'], key='sort',
+                             help='Rabatten beräknas mot visat ordinarie pris. Flerköp räknas per vara; viktpriser per kg. Sorter kan skilja sig. Okända jämförelser visas sist.')
     with refresh_col:
         if st.button('↻ Uppdatera', use_container_width=True):
             cached_offers.clear()
-            st.rerun(scope='fragment')
+            st.rerun()
     offers = select_offers(current, query, mode, expiry, order, today)
+    if order in ('Störst prissänkning (%)', 'Störst besparing (kr/enhet)'):
+        st.caption('Beräknat från visat ordinarie pris. Flerköp räknas per vara, viktpriser per kg/l. '
+                   'Priset kan variera mellan sorter. Erbjudanden utan jämförbara priser visas sist.')
     fetched = dt.datetime.fromisoformat(result['fetchedAt']).astimezone(STOCKHOLM).strftime('%H:%M')
     st.html(f'<div class="results-bar"><strong>{len(offers)} av {len(current)} erbjudanden</strong>'
-            f'<span>Hämtat {fetched} · Svensk tid · Uppdateras var 30:e minut</span></div>')
+            f'<span>Hämtat {fetched} · Svensk tid · Kontrolleras automatiskt</span></div>')
     if not offers:
         st.info('Inga matchningar. Prova ett annat sökord eller välj Alla slutdatum och Alla erbjudanden.')
         return
-    st.html('<div class="offer-grid">' + ''.join(card(offer, today) for offer in offers) + '</div>')
+    # Filtering always uses the full dataset; only the initial DOM is kept small.
+    filter_signature = (query, mode, expiry, order)
+    if st.session_state.get('display_filter') != filter_signature:
+        st.session_state['display_filter'] = filter_signature
+        st.session_state['show_all_offers'] = False
+    show_all = st.session_state.get('show_all_offers', False)
+    visible = offers if show_all else offers[:48]
+    st.html('<div class="offer-grid">' + ''.join(card(offer, today) for offer in visible) + '</div>')
+    if len(visible) < len(offers):
+        st.caption(f'Visar {len(visible)} av {len(offers)} matchningar. Sökningen omfattar alla erbjudanden.')
+        if st.button(f'Visa alla {len(offers)} erbjudanden', use_container_width=True):
+            st.session_state['show_all_offers'] = True
+            st.rerun()
 
 
 if __name__ == '__main__':

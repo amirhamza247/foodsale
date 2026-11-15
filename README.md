@@ -8,7 +8,10 @@ One Python application file displaying current public offers from Willys Halmsta
 - Membership and expiry filters, plus expiry/name sorting.
 - Product images, multi-buy wording, units, purchase limits, and validity dates.
 - All results pages are checked. Cached prices are rechecked for date validity before display.
-- Shared five-minute data cache; refresh button; automatic updates every 30 minutes while the session is active. Cache does not persist across server restarts.
+- Shared five-minute data cache with background refresh. A recent snapshot is returned immediately while refreshing; a visible warning labels data older than five minutes. Streamlit limits this stale window to one extra five-minute TTL by default, then requires a successful fetch. The page checks once a minute while active. Expired offers are always filtered out.
+- Store metadata is cached for 24 hours, independent initial requests overlap, and date parsing is memoized.
+- Initially renders 48 cards; search and filters cover the entire dataset. Use “Visa alla” to display all matches on the same page.
+- Manual refresh fetches current data. Caches are memory-only and do not survive restarts or hosting sleep.
 
 ## Run
 
@@ -32,3 +35,13 @@ The Willys website endpoints are undocumented and may change or restrict cloud a
 ## Verification
 
 The improvement pass checked 257 live offers, membership and expiry filtering, accent/multiword search, sorting, empty results, expired records, escaped HTML, incomplete source responses, and network failures. Browser checks covered light/dark appearance, search, expiry filtering, theme persistence, and a 390-pixel phone layout. No deployment or performance improvement is claimed from those checks.
+
+## Caching verification
+
+Verified background refresh returns a stale snapshot without blocking, concurrent readers share one refresh, completed refreshes replace cached values, and over-age data is refused if the source fails. UI checks cover the initial 48 cards, showing all 257, full-dataset search, and stale-data warnings. One local run measured the uncached fetch at 1.73 seconds before and 1.28 seconds after; a warm cache read was about 0.0009 seconds. These measure server data access, not total page load, and are not a hosted performance guarantee. Hosting cold starts and image downloads can still add latency.
+
+## Biggest price drops
+
+Under Sortera, choose `Störst prissänkning (%)` for descending relative reductions, or `Störst besparing (kr/enhet)` for descending kronor saved per source-priced unit (item, kg, or litre). Multi-buy totals are divided by the required item count. Missing, ranged, or incompatible price comparisons go last. Cards show the calculated reduction and saving. Calculations use the displayed ordinary price; grouped varieties can differ. These are offer-versus-ordinary comparisons, not historical price tracking. Verified against 257 live offers and focused tests for bundles, weight prices, unknown prices, and descending order.
+
+Audit fixes preserve source mix-and-match qualifiers, reject conflicting display units even when a numeric promotion price exists, and validate nested source shapes before parsing. Automated regression checks cover these cases and the friendly error state.
