@@ -197,7 +197,7 @@ STORES = {
     'ica-vallas': dict(name='ICA Supermarket Vallås', provider='ica', id='1003811', bms='2311', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/'),
     'ica-sondrum': dict(name='ICA Supermarket Söndrum', provider='ica', id='1003648', bms='2309', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/'),
     'ica-frosakull': dict(name='ICA Nära Frösakull', provider='ica', id='1004064', bms='11590', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/'),
-    'citygross': dict(name='City Gross Halmstad', provider='official', address='Stormgatan 14', source='https://www.citygross.se/butiker/halmstad'),
+    'citygross': dict(name='City Gross Halmstad', provider='citygross', id='3210', site='22', category='2930', member='PRIO', address='Stormgatan 14', source='https://www.citygross.se/butiker/halmstad'),
     'tempo-backagard': dict(name='Tempo Halmstad Bäckagård', provider='official', address='Akvarellgränd 1', source='https://www.tempo.se/butiker/tempo-halmstad-backagard/'),
 }
 
@@ -305,6 +305,7 @@ def ica_page_data(source, body, config):
     if body is None:
         markup = IcaPageText()
         markup.feed(source)
+        markup.close()
         body = ' '.join(markup.parts)
     counts = re.findall(r'Visar\s+(\d+)\s+(?:stycken|erbjudanden)', body)
     if (not isinstance(rows, list) or len(rows) > 2000 or not counts
@@ -486,6 +487,178 @@ def fetch_ica(store_key):
         ICA_BROWSER_LOCK.release()
 
 
+@cached_metadata(ttl=86400, max_entries=1)
+def citygross_metadata():
+    from urllib.robotparser import RobotFileParser
+    base = 'https://www.citygross.se/api/v1/'
+    rules = RobotFileParser()
+    rules.parse(read_public('https://www.citygross.se/robots.txt').splitlines())
+    paths = ('sites', 'PageData/2930', 'Loop54/category/2930/products')
+    if not all(rules.can_fetch('FoodSale', base + path) for path in paths):
+        raise ValueError('City Gross tillåter inte denna hämtning.')
+    sites = require_mapping(public_json(base + 'sites'), 'City Gross stores').get('sites')
+    if not isinstance(sites, list):
+        raise ValueError('City Gross butiker kunde inte bekräftas.')
+    matches = [site for site in sites if isinstance(site, dict) and site.get('id') == 22]
+    if (len(matches) != 1 or matches[0].get('name') != 'City Gross Halmstad'
+            or str(matches[0].get('storeNumber')) != '3210' or matches[0].get('city') != 'Halmstad'):
+        raise ValueError('City Gross svarade med fel butik.')
+    category = require_mapping(public_json(base + 'PageData/2930'), 'City Gross category')
+    page = require_mapping(category.get('data'), 'City Gross category data')
+    if (page.get('id') != 2930 or page.get('type') != 'ProductCategoryPage'
+            or page.get('name') != 'Veckans erbjudanden' or page.get('ispublished') is not True):
+        raise ValueError('City Gross kategori för veckoerbjudanden har ändrats.')
+    return matches[0]
+
+
+def normalize_citygross(rows, today):
+    if not isinstance(rows, list):
+        raise ValueError('Oväntat produktformat från City Gross.')
+    result, seen = [], set()
+    units = {'PCE': 'st', 'KGM': 'kg', 'LTR': 'l'}
+    for product in rows:
+        require_mapping(product, 'City Gross product')
+        identity = product.get('id')
+        if not isinstance(identity, str) or not identity or identity in seen:
+            raise ValueError('City Gross skickade dubbla eller ogiltiga produkter.')
+        seen.add(identity)
+        store = require_mapping(product.get('productStoreDetails'), 'City Gross store prices')
+        if str(store.get('id')) != '3210' or store.get('p_has_current_week_only_discount') is not True:
+            raise ValueError('City Gross skickade fel butik eller kampanjkategori.')
+        prices = require_mapping(store.get('prices'), 'City Gross prices')
+        promotion = require_mapping(prices.get('activePromotion'), 'City Gross active promotion')
+        promotions = prices.get('promotions')
+        if not isinstance(promotions, list) or promotion not in promotions:
+            raise ValueError('City Gross aktiva kampanj kunde inte bekräftas.')
+        start, end = iso_day(promotion.get('from')), iso_day(promotion.get('to'))
+        if start > end:
+            raise ValueError('City Gross skickade ogiltiga kampanjdatum.')
+        if not start <= today <= end:
+            continue
+        member = promotion.get('membersOnly')
+        quantity = promotion.get('minQuantity')
+        limit = promotion.get('maxAppliedPerReceipt')
+        if (type(member) is not bool or type(quantity) is not int or quantity < 1
+                or (limit is not None and (type(limit) is not int or limit < 0))):
+            raise ValueError('City Gross kampanjvillkor kunde inte bekräftas.')
+        details = require_mapping(promotion.get('priceDetails'), 'City Gross promotion price')
+        ordinary = require_mapping(prices.get('ordinaryPrice'), 'City Gross ordinary price')
+        unit = units.get(details.get('unit'))
+        ordinary_unit = units.get(ordinary.get('unit'))
+        value, each, reference = (price_amount(promotion.get('value')),
+                                  price_amount(details.get('price')), price_amount(ordinary.get('price')))
+        if not unit or not ordinary_unit or value is None or each is None or reference is None or min(value, each, reference) < 0:
+            raise ValueError('City Gross skickade ett ogiltigt pris eller enhet.')
+        effect = promotion.get('effectType')
+        if effect == 'ItemsTotal' and unit == 'st':
+            price = (f'{quantity} för {money(value)} kr' if quantity > 1 else f'{money(value)} kr/st')
+            paid_each = value / quantity
+        elif effect == 'PriceChangeAll' and quantity == 1:
+            price, paid_each = f'{money(value)} kr/{unit}', value
+        else:
+            raise ValueError('City Gross kampanjtyp stöds ännu inte.')
+        deposit = product.get('returnablePackageDepositInformation')
+        if deposit is not None:
+            require_mapping(deposit, 'City Gross deposit')
+        has_deposit = deposit is not None and deposit.get('description') == 'Pant'
+        if has_deposit:
+            price += ' +pant'
+        conditions = []
+        if limit:
+            conditions.append(f'Max {limit} erbjudandeköp per kvitto.')
+        minimum = promotion.get('minAmount')
+        if minimum is not None:
+            minimum = price_amount(minimum)
+            if minimum is None or minimum < 0:
+                raise ValueError('City Gross minsta köpesumma är ogiltig.')
+            if minimum:
+                conditions.append('Vid köp för minst ' + money(minimum) + ' kr.')
+        coupon = promotion.get('couponId')
+        if coupon:
+            conditions.append('Kupong krävs hos City Gross.')
+        comparison = price_amount(details.get('comparativePrice'))
+        comparison_unit = units.get(details.get('comparativePriceUnit'))
+        if comparison is not None and comparison_unit:
+            conditions.append('Jämförpris ' + money(comparison) + ' kr/' + comparison_unit)
+        lowest = prices.get('lowestPriceLast30Days')
+        if lowest is not None:
+            if isinstance(lowest, dict):
+                lowest_value, lowest_unit = price_amount(lowest.get('price')), units.get(lowest.get('unit'))
+            else:
+                lowest_value, lowest_unit = price_amount(lowest), ordinary_unit
+            if lowest_value is not None and lowest_unit:
+                conditions.append('Lägsta pris 30 dagar: ' + money(lowest_value) + ' kr/' + lowest_unit)
+        metrics = dict(discount_percent=None, saving=None, saving_unit='')
+        if (unit == ordinary_unit and reference > 0 and not minimum and not coupon
+                and abs(paid_each - each) <= Decimal('0.011')):
+            saving = max(Decimal(0), reference - paid_each)
+            metrics = dict(discount_percent=float(saving / reference * 100), saving=float(saving), saving_unit=unit)
+        name = plain_text(product.get('name'))
+        if not name:
+            raise ValueError('City Gross produkten saknar namn.')
+        images = product.get('images') or []
+        if not isinstance(images, list):
+            raise ValueError('City Gross bilder har oväntat format.')
+        image = ''
+        for candidate in images:
+            require_mapping(candidate, 'City Gross image')
+            path = candidate.get('url')
+            if path:
+                if not isinstance(path, str):
+                    raise ValueError('City Gross bildlänk är ogiltig.')
+                image = safe_image(path) if urllib.parse.urlsplit(path).scheme else (
+                    'https://www.citygross.se/images/products/' + urllib.parse.quote(path, safe='/') + '?w=300&h=300')
+                break
+        keywords = product.get('marketingKeyWords') or []
+        if not isinstance(keywords, list) or any(not isinstance(word, str) for word in keywords):
+            raise ValueError('City Gross sökord har oväntat format.')
+        result.append(dict(name=name, brand=plain_text(product.get('brand')),
+            volume=plain_text(product.get('descriptiveSize')), description=plain_text(product.get('subtitle')),
+            search_extra=' '.join(keywords), image=image, price=price,
+            ordinary=money(reference) + ' kr/' + ordinary_unit + (' +pant' if has_deposit else ''),
+            member=member, member_label='PRIO', eligibility='Kupong krävs' if coupon else ('LOYALTY' if member else 'GENERAL'),
+            conditions=conditions, start=start.isoformat(), end=end.isoformat(), **metrics))
+    return result
+
+
+def fetch_citygross():
+    config, store = STORES['citygross'], citygross_metadata()
+    base = 'https://www.citygross.se/api/v1/Loop54/category/2930/products'
+    rows, expected, size, pages, began = [], None, 500, None, time.monotonic()
+    for page in range(10):
+        if time.monotonic() - began > 40:
+            raise TimeoutError('City Gross hämtning tog för lång tid.')
+        params = dict(currentWeekDiscountOnly='true', store='3210', take=500, skip=page * size,
+                      SortField='p_name', SortOrder='ASC')
+        data = require_mapping(public_json(base + '?' + urllib.parse.urlencode(params)), 'City Gross product page')
+        batch = data.get('items')
+        total, page_size, total_pages = data.get('totalCount'), data.get('pageSize'), data.get('totalPages')
+        if (not isinstance(batch, list) or type(total) is not int or not 0 <= total <= 5000
+                or type(page_size) is not int or not 1 <= page_size <= 500
+                or type(total_pages) is not int or not 0 <= total_pages <= 10
+                or type(data.get('currentPage')) is not int or data['currentPage'] != page
+                or len(batch) > page_size):
+            raise ValueError('City Gross sidindelning har ändrats.')
+        if expected is None:
+            expected, size, pages = total, page_size, total_pages
+            if pages != (total + size - 1) // size and not (total == 0 and pages == 1):
+                raise ValueError('City Gross sidantal är inkonsekvent.')
+        elif (total, page_size, total_pages) != (expected, size, pages):
+            raise ValueError('City Gross priser ändrades under hämtningen.')
+        rows.extend(batch)
+        if page + 1 >= pages:
+            break
+    else:
+        raise ValueError('City Gross skickade för många sidor.')
+    if len(rows) != expected:
+        raise ValueError('City Gross produktlista är ofullständig.')
+    now = dt.datetime.now(STOCKHOLM)
+    return dict(store=config['name'], address=plain_text(store.get('streetAddress')), source=config['source'],
+                fetchedAt=now.isoformat(), sourceResults=len(rows), today=now.date().isoformat(),
+                offers=normalize_citygross(rows, now.date()),
+                note='City Gross webbpriser för Halmstad. PRIO-priser kräver medlemskap. Se butikens fullständiga villkor.')
+
+
 def public_json(url, headers=None):
     return json.loads(read_public(url, headers))
 
@@ -506,6 +679,7 @@ def plain_text(value):
         raise ValueError('Oväntat textformat från butiken.')
     parser = TextOnly()
     parser.feed(value)
+    parser.close()
     return ' '.join(' '.join(parser.parts).split())
 
 
@@ -1424,7 +1598,7 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
 <footer class="footnote"><strong>Food Sale / Halmstad</strong><p>Offentliga butikserbjudanden. Medlemspriser kräver medlemskap hos respektive kedja. Personliga kuponger och lokalt lagersaldo ingår inte. Kontrollera alltid pris och villkor hos butiken. Fristående visare.</p></footer>
 <noscript><p>Aktivera JavaScript för att söka och filtrera erbjudanden. Butikerna finns också via sina officiella erbjudandesidor.</p></noscript>
 </div>
-<script id="catalogue" type="application/json">{"willys-oster": {"name": "Willys Halmstad Öster", "provider": "axfood", "address": "Laholmsvägen 37", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2236"}, "willys-flygstaden": {"name": "Willys Halmstad Flygstaden", "provider": "axfood", "address": "Kundvägen 4", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2137"}, "hemkop-c": {"name": "Hemköp Halmstad C", "provider": "axfood", "address": "Brogatan 14–16", "member": "Klubb Hemköp", "source": "https://www.hemkop.se/butik/4245"}, "coop-stora": {"name": "Stora Coop Halmstad", "provider": "coop", "address": "Prästvägen 1", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/stora-coop/stora-coop-halmstad/"}, "coop-gamletull": {"name": "Coop Gamletull Halmstad", "provider": "coop", "address": "Gamletullsgatan 20", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-gamletull-halmstad/"}, "coop-flygaregatan": {"name": "Coop Flygaregatan", "provider": "coop", "address": "Flygaregatan 12", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-flygaregatan/"}, "coop-furuvagen": {"name": "Coop Furuvägen", "provider": "coop", "address": "Furuvägen 63", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-furuvagen/"}, "coop-fyllinge": {"name": "Coop Fyllinge", "provider": "coop", "address": "Fyllingevägen 2", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-fyllinge/"}, "xtra-snostorp": {"name": "X:-Tra Snöstorpsvägen", "provider": "coop", "address": "Snöstorpsvägen 109", "member": "Coop-medlem", "source": "https://x-tra.se/butiker/snoestorpsvaegen"}, "lidl-torpaledsvagen": {"name": "Lidl Torpaledsvägen", "provider": "lidl", "address": "Torpaledsvägen 4", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/torpaledsvaegen-4/"}, "lidl-gesallgatan": {"name": "Lidl Gesällgatan", "provider": "lidl", "address": "Gesällgatan 3", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/gesaellgatan-3/"}, "lidl-tegelbruket": {"name": "Lidl Tegelbruket", "provider": "lidl", "address": "Tegelbruket 1", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/tegelbruket-1/"}, "ica-hogskolan": {"name": "Maxi ICA Stormarknad Högskolan", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/"}, "ica-flygstaden": {"name": "Maxi ICA Stormarknad Flygstaden", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/"}, "ica-vallas": {"name": "ICA Supermarket Vallås", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/"}, "ica-sondrum": {"name": "ICA Supermarket Söndrum", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/"}, "ica-frosakull": {"name": "ICA Nära Frösakull", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/"}, "citygross": {"name": "City Gross Halmstad", "provider": "official", "address": "Stormgatan 14", "source": "https://www.citygross.se/butiker/halmstad"}, "tempo-backagard": {"name": "Tempo Halmstad Bäckagård", "provider": "official", "address": "Akvarellgränd 1", "source": "https://www.tempo.se/butiker/tempo-halmstad-backagard/"}}</script>
+<script id="catalogue" type="application/json">{"willys-oster": {"name": "Willys Halmstad Öster", "provider": "axfood", "address": "Laholmsvägen 37", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2236"}, "willys-flygstaden": {"name": "Willys Halmstad Flygstaden", "provider": "axfood", "address": "Kundvägen 4", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2137"}, "hemkop-c": {"name": "Hemköp Halmstad C", "provider": "axfood", "address": "Brogatan 14–16", "member": "Klubb Hemköp", "source": "https://www.hemkop.se/butik/4245"}, "coop-stora": {"name": "Stora Coop Halmstad", "provider": "coop", "address": "Prästvägen 1", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/stora-coop/stora-coop-halmstad/"}, "coop-gamletull": {"name": "Coop Gamletull Halmstad", "provider": "coop", "address": "Gamletullsgatan 20", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-gamletull-halmstad/"}, "coop-flygaregatan": {"name": "Coop Flygaregatan", "provider": "coop", "address": "Flygaregatan 12", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-flygaregatan/"}, "coop-furuvagen": {"name": "Coop Furuvägen", "provider": "coop", "address": "Furuvägen 63", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-furuvagen/"}, "coop-fyllinge": {"name": "Coop Fyllinge", "provider": "coop", "address": "Fyllingevägen 2", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-fyllinge/"}, "xtra-snostorp": {"name": "X:-Tra Snöstorpsvägen", "provider": "coop", "address": "Snöstorpsvägen 109", "member": "Coop-medlem", "source": "https://x-tra.se/butiker/snoestorpsvaegen"}, "lidl-torpaledsvagen": {"name": "Lidl Torpaledsvägen", "provider": "lidl", "address": "Torpaledsvägen 4", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/torpaledsvaegen-4/"}, "lidl-gesallgatan": {"name": "Lidl Gesällgatan", "provider": "lidl", "address": "Gesällgatan 3", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/gesaellgatan-3/"}, "lidl-tegelbruket": {"name": "Lidl Tegelbruket", "provider": "lidl", "address": "Tegelbruket 1", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/tegelbruket-1/"}, "ica-hogskolan": {"name": "Maxi ICA Stormarknad Högskolan", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/"}, "ica-flygstaden": {"name": "Maxi ICA Stormarknad Flygstaden", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/"}, "ica-vallas": {"name": "ICA Supermarket Vallås", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/"}, "ica-sondrum": {"name": "ICA Supermarket Söndrum", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/"}, "ica-frosakull": {"name": "ICA Nära Frösakull", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/"}, "citygross": {"name": "City Gross Halmstad", "provider": "citygross", "address": "Stormgatan 14", "source": "https://www.citygross.se/butiker/halmstad"}, "tempo-backagard": {"name": "Tempo Halmstad Bäckagård", "provider": "official", "address": "Akvarellgränd 1", "source": "https://www.tempo.se/butiker/tempo-halmstad-backagard/"}}</script>
 <script>'use strict';
 const catalogue=JSON.parse(document.getElementById('catalogue').textContent);
 const $=id=>document.getElementById(id);
@@ -1467,7 +1641,7 @@ async function load(force=false){
   const response=await fetch('/api/offers?'+query,{method:force?'POST':'GET',headers:force?{'X-FoodSale-Request':'1'}:{},signal:controller.signal,cache:'no-store'});
   const data=await response.json();if(requestId!==sequence)return;
   if(!response.ok||data.status!=='ok')throw new Error(data.message||'Erbjudandena kunde inte hämtas. Försök igen om en stund.');
-  $('grid').innerHTML=data.cards;if(catalogue[store].provider==='ica'&&data.shown>0)$('store').selectedOptions[0].textContent=catalogue[store].name;$('official').hidden=true;$('summary').hidden=false;$('filters').hidden=false;$('total').textContent=data.total;$('members').textContent=data.members;$('ending').textContent=data.ending;
+  $('grid').innerHTML=data.cards;if(['ica','citygross'].includes(catalogue[store].provider)&&data.shown>0)$('store').selectedOptions[0].textContent=catalogue[store].name;$('official').hidden=true;$('summary').hidden=false;$('filters').hidden=false;$('total').textContent=data.total;$('members').textContent=data.members;$('ending').textContent=data.ending;
   $('results-count').textContent=`${data.matches} av ${data.total} erbjudanden`;
   $('search-note').textContent=data.searchApproximate?`Inga exakta träffar. Visar ${data.matches} liknande träffar.`:'';$('search-note').hidden=!data.searchApproximate;
   fetchedAt=data.fetchedAt;const date=new Date(fetchedAt);$('freshness').textContent='Hämtat '+date.toLocaleString('sv-SE',{timeZone:'Europe/Stockholm',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+' · svensk tid';
@@ -1477,7 +1651,7 @@ async function load(force=false){
   $('page-note').textContent=data.hasMore?`Visar ${data.shown} av ${data.matches}. Sökningen omfattar alla erbjudanden.`:'';
   $('more').textContent='Visa 48 till';$('all').textContent=`Visa alla ${data.matches}`;
   schedule(data.refreshing?3:60);
- }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;clearCards();if(catalogue[store].provider==='ica'){$('official').hidden=false;$('summary').hidden=true;$('filters').hidden=true;$('store').selectedOptions[0].textContent=catalogue[store].name+' · Officiell sida'}notice(error.message||'Anslutningen misslyckades. Försök igen.','error');schedule(60)}
+ }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;clearCards();if(['ica','citygross'].includes(catalogue[store].provider)){$('official').hidden=false;$('summary').hidden=true;$('filters').hidden=true;$('store').selectedOptions[0].textContent=catalogue[store].name+' · Officiell sida'}notice(error.message||'Anslutningen misslyckades. Försök igen.','error');schedule(60)}
  finally{if(requestId===sequence){$('grid').setAttribute('aria-busy','false');$('refresh').disabled=false;$('refresh').querySelector('.button-label').textContent='Uppdatera'}}
 }
 $('filters').addEventListener('submit',event=>{event.preventDefault();limit=48;load()});
@@ -1490,7 +1664,7 @@ document.addEventListener('visibilitychange',()=>{if(document.visibilityState===
 </script>
 </body></html>
 """
-CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-/AkDCmVjFcGS0Zf1wS161tUDre8SNNRrGYh1Rj5DpsY=' 'sha256-1VzIoRi5WvQ5mCDJoS6VrQ84CNlvqENbJSk0vC8QerM='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-C8FywE6pgTQWkw7XVLvcSGV3dZBz9kKfttVfcQN1jAc=' 'sha256-KAUzIMVLwCuVz/E/BxqKm+IKYPMMGGfQoWbAxUxPGHA='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 MEMBERSHIP = {'all': 'Alla erbjudanden', 'general': 'Utan medlemskrav', 'member': 'Medlemspriser'}
 EXPIRY = {'all': 'Alla slutdatum', 'today': 'Slutar idag', 'soon': 'Inom 3 dagar'}
@@ -1509,7 +1683,8 @@ def store_snapshot(store_key, force=False):
     else:
         key = (store_key, today)
         loader = lambda: (fetch_ica(store_key) if config['provider'] == 'ica' else
-                          fetch_coop(store_key) if config['provider'] == 'coop' else fetch_offers(store_key))
+                          fetch_coop(store_key) if config['provider'] == 'coop' else
+                          fetch_citygross() if config['provider'] == 'citygross' else fetch_offers(store_key))
     cache = ica_offer_cache if config['provider'] == 'ica' else offer_cache
     snapshot = cache.get(key, loader, force=force)
     age = (dt.datetime.now(STOCKHOLM) - dt.datetime.fromisoformat(snapshot.value['fetchedAt'])).total_seconds()

@@ -34,7 +34,7 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 
 ## Store support
 
-19 selectable stores; **17 product integrations**, plus City Gross leaflet links and a Tempo official-page link. ICA falls back to the official page if browser access or extraction fails.
+19 selectable stores; **18 product integrations**, plus a Tempo official-page link. ICA falls back to the official page if browser access or extraction fails.
 
 | Stores | Support |
 |---|---|
@@ -44,7 +44,7 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 | Lidl Torpaledsvägen, Gesällgatan, Tegelbruket | Shared published campaigns; prices must agree across all three Halmstad regions. Branch identity is checked. Reference-price savings appear only when supported by the data. |
 | Maxi ICA Högskolan, Maxi ICA Flygstaden, ICA Supermarket Vallås, ICA Supermarket Söndrum, ICA Nära Frösakull | Playwright product cards, search, filters and safe discount calculations; verified locally for all five branches. Source supplies expiry dates but no start dates. |
 | Tempo Halmstad Bäckagård | Official-page link; publication provider refused automated extraction. |
-| City Gross Halmstad | Official store/leaflet link; a complete product feed remains unresolved. |
+| City Gross Halmstad | Store-specific website offers, PRIO labels, dates, bundle/kg prices, pant, limits and safe savings. Public product feed discovered through Playwright; fetched directly with HTTP. |
 
 No personal coupons, account logins, purchases, or local stock guarantees. Missing or incompatible comparison prices are never invented. “Biggest price drop” compares the source's displayed ordinary/reference price with the offer, rather than tracking historical price changes.
 
@@ -74,25 +74,22 @@ If the existing Render service uses the Python runtime, deploy this version as a
 
 ## Verification
 
-Automated API checks cover all 19 store states, 17 product views using recorded fixtures, full-dataset search, membership, pagination, input validation, escaped source content, refresh-origin checks, stale warnings, and graceful source errors. Cache checks cover simultaneous cold reads, one background refresh, replacement, failure, branch isolation, and the hard age cap. Pricing regression checks cover multi-buy totals, incompatible units, percentage/saving sorts, and the newly encountered Coop deal formats.
+Automated API checks cover all 19 store states, 18 product views using recorded fixtures, full-dataset search, membership, pagination, input validation, escaped source content, refresh-origin checks, stale warnings, and graceful source errors. Cache checks cover simultaneous cold reads, one background refresh, replacement, failure, branch isolation, and the hard age cap. Pricing regression checks cover multi-buy totals, incompatible units, percentage/saving sorts, and the newly encountered Coop deal formats.
 
 JavaScript interactions were tested with an emulated DOM against a real local HTTP API: initial/all cards, empty search, reset, store/member changes, persistent theme, official-page fallback, and manual refresh. This was not visual browser testing; the user handles visual checks.
 
 Final local live checks passed for all 12 integrated branches. There were 12 successful extraction attempts out of 13 including the initial Stora Coop failure that prompted the format fix. Peak macOS process RSS during the extraction run was 95.3 MiB. One real HTTP smoke test measured the shell at 0.93 ms, cold Willys offers at 0.970 seconds, and a warm filtered response at 4.91 ms. These are local observations, not end-to-end page-load or hosted performance guarantees. Detailed benchmark evidence is supplied with the migration report.
 
 
-## City Gross leaflet support and ICA access
+## City Gross, ICA and Tempo sources
 
-Selecting City Gross now loads its current official Halmstad leaflet links and the source's validity wording directly in the app. Links are checked against store 3210 and an HTTPS publication URL allowlist, with a five-minute cache, bounded background refresh and a ten-minute maximum age. Expired publication links are excluded. A feed failure keeps the official store link available and shows a clear message.
+City Gross now shows the Halmstad weekly product view, not leaflet links. Playwright verified ordinary store selection and revealed the public product endpoint used by its site. Lightweight HTTP can read it directly with `store=3210` and `currentWeekDiscountOnly=true`, so City Gross does not need a Chromium instance for each refresh. Its robots rules, Halmstad store mapping and weekly category are checked and cached. A large, explicitly sorted page avoids the unstable relevance pagination observed during discovery; if further pages are needed, totals, page numbers and unique IDs must agree or extraction fails.
 
-This is **leaflet-link support, not a product integration**: City Gross still has no product search, membership filtering or discount sorting here. Its public product feed returned zero results, and the linked publication reader closed the extraction connection. No PDF/OCR or browser dependency was added without a working source to validate.
+The source's active promotion determines the displayed deal, preserving PRIO membership, dates, multi-buy, kg prices, pant, receipt limits and comparison prices. Other longer-running promotions are not substituted for the site's active deal. These are **City Gross website prices for Halmstad**; the app does not claim to verify physical-store stock or separate leaflet-only offers. The earlier leaflet API is retained for compatibility, but the normal City Gross product view does not fetch it. Source failure retains an official-page fallback.
 
-ICA's plain HTTP requests returned 403, but ordinary Playwright Chromium successfully reads all five offer pages. The adapter checks robots.txt, the exact branch/account identifiers, page totals, unique offer IDs and eligibility. It preserves Stammis membership, restrictions, multi-buy wording, variants and expiry dates. Start dates are absent, so ICA cards say “Gäller till”; undated-start offers are only eligible on their observed date. No login, personal coupons, stealth configuration, proxies or challenge solving are used. Tempo remains unchanged.
+ICA's plain HTTP requests returned 403, but ordinary Playwright Chromium successfully reads all five offer pages. The adapter checks robots.txt, exact branch/account identifiers, page totals, unique offer IDs and eligibility. It preserves Stammis membership, restrictions, multi-buy wording, variants and expiry dates. Start dates are absent, so ICA cards say “Gäller till”; undated-start offers are only eligible on their observed date. No login, personal coupons, stealth configuration, proxies or challenge solving are used.
 
-Each ICA selector option retains “Officiell sida” until its product cards actually render for that visitor. Failed extraction shows the official link and restores the label. Successful card rendering removes it; other stores' fallback labels are retained.
-
-Focused automated tests cover leaflet branch/date/URL/schema validation, duplicate removal, warm-cache reuse and sanitized errors. Existing API/cache and DOM checks remain applicable. A local single-sample live check found the week 47 Halmstad leaflet (16–22 November 2026): 0.109 seconds cold, 0.012 milliseconds warm, 51.2 MiB peak process RSS. These measure leaflet metadata only; product extraction and Render source access remain unverified.
-
+ICA and City Gross selector labels retain “Officiell sida” until their product cards actually render for that visitor. Failed extraction shows the official link and restores the label. Successful recovery removes it again. Tempo remains an official link: its own public store page exposes a Tjek widget rather than product data, and the publication provider previously explicitly refused automated extraction. The browser check blocked that provider and did not try to bypass its restriction.
 
 ## ICA integration checks
 
@@ -121,4 +118,11 @@ Numbers and known units stay literal. Measurements are bound as pairs: `450 g` c
 
 A bounded cache holds up to 4,096 public product-text documents. It does not cache visitor queries, product eligibility or search responses. Text changes generate new entries; current dates, membership and expiry are filtered on every request. Search adds no upstream calls, embeddings, database or external service.
 
-Automated tests cover typo fallback, exact ranking, protected words, number/unit pairs, source-text changes, expiry/membership, variants, explicit sorting, unchanged cached offers, full-result pagination and API labels. Local measurements on 301 recorded offers took about 0.8–9.1 ms median per query with Python allocation tracing enabled, and about 0.5 MB additional traced allocations. These measure search selection only, not fetching, page rendering or Render performance. Search changes are not deployed automatically.
+Automated tests cover typo fallback, exact ranking, protected words, number/unit pairs, source-text changes, expiry/membership, variants, explicit sorting, unchanged cached offers, full-result pagination and API labels. Local measurements on 301 recorded offers took about 0.2–7.2 ms median per query, an 8.8 ms cold text-index build, and about 0.37 MB additional Python traced allocations (measured separately from timings). These measure search selection only, not fetching, page rendering or Render performance. This change does not itself deploy the app; hosted verification is a separate step.
+
+
+## City Gross verification
+
+A real local API check retrieved all 252 Halmstad products, including 32 active PRIO deals and 38 offers ending on 18 November 2026. Cold retrieval plus metadata, normalization and 48-card generation took 1.89 seconds; serving all 252 cards from cache took 8.3 ms. Peak process RSS was about 70 MiB, without a browser process. This is one local sample, not a hosted performance guarantee.
+
+Tests cover exact store/category and robots checks, complete paging, duplicate/missing/changed pages, invalid nested fields, dates, membership, multi-buy and kg calculations, mismatched units, deposits, limits, search, pagination and sorting. A raw ampersand at the end of a product name exposed an HTML text-parser buffering issue; closing the parser now preserves names such as “Dill&Gräslök”. Automated DOM tests confirm City Gross cards, PRIO filtering, source-failure recovery and conditional label removal. The agent did not commit, push or deploy these changes.
