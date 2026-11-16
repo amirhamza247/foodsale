@@ -161,6 +161,8 @@ class OfferCache:
 
 
 offer_cache = OfferCache()
+# Slow Chromium work has its own queue so it cannot occupy the HTTP-source workers.
+ica_offer_cache = OfferCache(workers=1)
 
 
 BASE = "https://www.willys.se"
@@ -188,14 +190,298 @@ STORES = {
     'lidl-torpaledsvagen': dict(name='Lidl Torpaledsvägen', provider='lidl', address='Torpaledsvägen 4', member='Lidl Plus', source='https://www.lidl.se/s/sv-SE/butiker/halmstad/torpaledsvaegen-4/'),
     'lidl-gesallgatan': dict(name='Lidl Gesällgatan', provider='lidl', address='Gesällgatan 3', member='Lidl Plus', source='https://www.lidl.se/s/sv-SE/butiker/halmstad/gesaellgatan-3/'),
     'lidl-tegelbruket': dict(name='Lidl Tegelbruket', provider='lidl', address='Tegelbruket 1', member='Lidl Plus', source='https://www.lidl.se/s/sv-SE/butiker/halmstad/tegelbruket-1/'),
-    'ica-hogskolan': dict(name='Maxi ICA Stormarknad Högskolan', provider='official', address='Halmstad', source='https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/'),
-    'ica-flygstaden': dict(name='Maxi ICA Stormarknad Flygstaden', provider='official', address='Halmstad', source='https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/'),
-    'ica-vallas': dict(name='ICA Supermarket Vallås', provider='official', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/'),
-    'ica-sondrum': dict(name='ICA Supermarket Söndrum', provider='official', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/'),
-    'ica-frosakull': dict(name='ICA Nära Frösakull', provider='official', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/'),
+    'ica-hogskolan': dict(name='Maxi ICA Stormarknad Högskolan', provider='ica', id='1003925', bms='2308', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/'),
+    'ica-flygstaden': dict(name='Maxi ICA Stormarknad Flygstaden', provider='ica', id='1003781', bms='11066', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/'),
+    'ica-vallas': dict(name='ICA Supermarket Vallås', provider='ica', id='1003811', bms='2311', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/'),
+    'ica-sondrum': dict(name='ICA Supermarket Söndrum', provider='ica', id='1003648', bms='2309', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/'),
+    'ica-frosakull': dict(name='ICA Nära Frösakull', provider='ica', id='1004064', bms='11590', member='Stammis', address='Halmstad', source='https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/'),
     'citygross': dict(name='City Gross Halmstad', provider='official', address='Stormgatan 14', source='https://www.citygross.se/butiker/halmstad'),
     'tempo-backagard': dict(name='Tempo Halmstad Bäckagård', provider='official', address='Akvarellgränd 1', source='https://www.tempo.se/butiker/tempo-halmstad-backagard/'),
 }
+
+
+def normalize_city_leaflets(rows, today):
+    """Validate branch-specific leaflet links; never infer individual product prices."""
+    if not isinstance(rows, list) or len(rows) > 50:
+        raise ValueError('Oväntat reklambladsformat.')
+    result, seen = [], set()
+    for row in rows:
+        require_mapping(row, 'reklamblad')
+        if str(row.get('store')) != '3210':
+            raise ValueError('Reklambladet tillhör en annan butik.')
+        start, end = iso_day(row.get('availableFrom')), iso_day(row.get('availableTo'))
+        if start > end:
+            raise ValueError('Ogiltiga datum för reklambladet.')
+        if not start <= today <= end:
+            continue
+        link = row.get('link', '')
+        if not isinstance(link, str) or not re.fullmatch(r'https://online\.flippingbook\.com/view/[0-9]+/?', link):
+            raise ValueError('Oväntad reklambladslänk.')
+        title = plain_text(row.get('title'))
+        if not title:
+            raise ValueError('Reklambladet saknar titel.')
+        if link not in seen:
+            result.append(dict(title=title, url=link, start=start.isoformat(), end=end.isoformat(),
+                               description=plain_text(row.get('subTitle'))))
+            seen.add(link)
+    return result
+
+
+def fetch_city_leaflets():
+    now = dt.datetime.now(STOCKHOLM)
+    rows = public_json('https://www.citygross.se/api/v1/leaflets?store=3210')
+    return dict(fetchedAt=now.isoformat(), leaflets=normalize_city_leaflets(rows, now.date()))
+
+
+# Chromium is short-lived and only one ICA fetch may own it per server process.
+ICA_BROWSER_LOCK = threading.Lock()
+ICA_ROBOTS = None
+ICA_ROBOTS_SAVED = 0
+
+
+def ica_json_field(script, name):
+    """Decode an embedded array/object as data, without eval or executing source text."""
+    match = re.search(r'"' + re.escape(name) + r'"\s*:\s*([\[{])', script)
+    if not match:
+        raise ValueError('ICA saknar förväntade uppgifter.')
+    start, depth, quoted, escaped = match.end() - 1, 0, False, False
+    for index in range(start, len(script)):
+        char = script[index]
+        if escaped:
+            escaped = False
+            continue
+        if quoted and char == '\\':
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+        if not quoted:
+            if char in '[{':
+                depth += 1
+            elif char in ']}':
+                depth -= 1
+                if depth == 0:
+                    raw = script[start:index + 1]
+                    # Initial state uses JS undefined; never change it inside strings.
+                    raw = re.sub(r'"(?:\\.|[^"\\])*"|\bundefined\b',
+                                 lambda token: 'null' if token.group() == 'undefined' else token.group(), raw)
+                    return json.loads(raw)
+    raise ValueError('ICA skickade ofullständiga uppgifter.')
+
+
+class IcaPageText(HTMLParser):
+    """Read server-rendered offer counts without running page scripts."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hidden, self.parts = 0, []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style', 'noscript'):
+            self.hidden += 1
+
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style', 'noscript'):
+            self.hidden = max(0, self.hidden - 1)
+
+    def handle_data(self, value):
+        if not self.hidden:
+            self.parts.append(value)
+
+
+def ica_page_data(source, body, config):
+    if len(source) > 12_000_000:
+        raise ValueError('ICA:s svar är för stort.')
+    match = re.search(r'<script(?:\s[^>]*)?>\s*window\.__INITIAL_DATA__\s*=\s*(.*?)</script\s*>', source, re.S)
+    if not match:
+        raise ValueError('ICA:s produktdata saknas.')
+    script = match.group(1)
+    store = require_mapping(ica_json_field(script, 'storeInfoModel'), 'ICA store')
+    if (store.get('accountNumber') != config['id'] or store.get('storeName') != config['name']
+            or str(store.get('storeId')) != config['bms']):
+        raise ValueError('ICA svarade med fel butik.')
+    rows = ica_json_field(script, 'weeklyOffers')
+    if body is None:
+        markup = IcaPageText()
+        markup.feed(source)
+        body = ' '.join(markup.parts)
+    counts = re.findall(r'Visar\s+(\d+)\s+(?:stycken|erbjudanden)', body)
+    if (not isinstance(rows, list) or len(rows) > 2000 or not counts
+            or any(int(count) != len(rows) for count in counts)):
+        raise ValueError('ICA:s produktlista kunde inte bekräftas som komplett.')
+    return rows
+
+
+def ica_discount(row, store, price):
+    """Use unambiguous priced units only; never use the lowest price of a range."""
+    unknown = dict(discount_percent=None, saving=None, saving_unit='')
+    mechanics = require_mapping(row.get('parsedMechanics'), 'ICA price mechanics')
+    if mechanics.get('benefitType') == 'PERCOFF':
+        percent = re.fullmatch(r'(\d+(?:[.,]\d+)?)\s*%\s*rabatt', price, re.I)
+        if percent and 0 < Decimal(percent.group(1).replace(',', '.')) <= 100:
+            return dict(unknown, discount_percent=float(percent.group(1).replace(',', '.')))
+        return unknown
+    if mechanics.get('benefitType') != 'FIXED':
+        return unknown
+    single = re.fullmatch(r'(\d+(?:[.,:]\d{1,2})?)\s+kr/(st|kg|l|liter)(?:\s*\+\s*pant)?', price, re.I)
+    bundle = re.fullmatch(r'(\d+)\s+för\s+(\d+(?:[.,:]\d{1,2})?)\s+kr(?:\s*\+\s*pant)?', price, re.I)
+    if single:
+        unit = 'l' if single.group(2).lower() == 'liter' else single.group(2).lower()
+        amount = price_amount(single.group(1))
+    elif (bundle and int(bundle.group(1)) > 0 and type(mechanics.get('quantity')) is int
+          and mechanics['quantity'] == int(bundle.group(1))):
+        unit, amount = 'st', price_amount(bundle.group(2)) / Decimal(bundle.group(1))
+    else:
+        return unknown
+    ordinary = price_amount(store.get('regularPrice'))
+    reference = plain_text(store.get('referencePriceText'))
+    explicit_units = re.findall(r'/\s*(st|kg|l|liter)\b', reference.casefold())
+    if ordinary is None or ordinary <= 0 or any(('l' if x == 'liter' else x) != unit for x in explicit_units):
+        return unknown
+    saving = max(Decimal(0), ordinary - amount)
+    return dict(discount_percent=float(saving / ordinary * 100), saving=float(saving), saving_unit=unit)
+
+
+def normalize_ica(rows, config, today):
+    if not isinstance(rows, list):
+        raise ValueError('Oväntat ICA-format.')
+    offers, seen = [], set()
+    for row in rows:
+        require_mapping(row, 'ICA offer')
+        identity = row.get('id')
+        if not isinstance(identity, str) or not identity or identity in seen:
+            raise ValueError('ICA skickade dubbla eller ogiltiga erbjudanden.')
+        seen.add(identity)
+        details = require_mapping(row.get('details'), 'ICA details')
+        stores = row.get('stores')
+        if not isinstance(stores, list) or len(stores) != 1:
+            raise ValueError('ICA:s butikspriser kunde inte bekräftas.')
+        store = require_mapping(stores[0], 'ICA offer store')
+        if store.get('storeMarketingName') != config['name'] or str(store.get('BMSStoreId')) != config['bms']:
+            raise ValueError('ICA skickade priser för fel butik.')
+        if type(store.get('storeInd')) is not bool:
+            raise ValueError('ICA saknar uppgift om erbjudandet gäller i butik.')
+        end = iso_day(row.get('validTo'))
+        if not store['storeInd'] or end < today:
+            continue
+        # The public current-offer page establishes observation today, not a start date.
+        start = iso_day(row['validFrom']).isoformat() if row.get('validFrom') else None
+        if start and dt.date.fromisoformat(start) > today:
+            continue
+        name, price = plain_text(details.get('name')), plain_text(details.get('mechanicInfo'))
+        if not name or not price:
+            raise ValueError('ICA saknar produktnamn eller visningspris.')
+        traits = row.get('traits')
+        if not isinstance(traits, list) or any(not isinstance(t, str) for t in traits):
+            raise ValueError('ICA:s medlemsvillkor kunde inte bekräftas.')
+        member = any(t.casefold() == 'stammis' for t in traits)
+        self_scan = details.get('isSelfScan')
+        if type(self_scan) is not bool:
+            raise ValueError('ICA:s behörighetsvillkor saknas.')
+        conditions = []
+        for text in [row.get('condition'), row.get('restriction'), details.get('disclaimer'),
+                     row.get('comparisonPrice'), store.get('ecomDisclaimer')]:
+            value = plain_text(text)
+            if value and value not in conditions:
+                conditions.append(value)
+        if self_scan:
+            conditions.append('Gäller vid självscanning. Se butikens villkor.')
+        for trait in traits:
+            if trait.casefold() not in ('stammis', 'butiksunikt') and trait not in conditions:
+                conditions.append(trait)
+        eans = row.get('eans')
+        if not isinstance(eans, list):
+            raise ValueError('ICA:s sortinformation är ogiltig.')
+        variants, image = [], ''
+        for ean in eans:
+            require_mapping(ean, 'ICA variety')
+            text = plain_text(ean.get('articleDescription'))
+            if text and text not in variants:
+                variants.append(text)
+            if not image and ean.get('image'):
+                image = safe_image(ean['image'])
+        if not image:
+            picture = require_mapping(row.get('picture'), 'ICA image')
+            # Plain publication IDs only; unresolved Cloudinary templates are not URLs.
+            filename = picture.get('fileName')
+            if isinstance(filename, str) and re.fullmatch(r'[a-zA-Z0-9_-]+', filename):
+                image = 'https://assets.icanet.se/c_fit,w_300,h_300/' + filename
+        ordinary = plain_text(store.get('regularPrice'))
+        reference = plain_text(store.get('referencePriceText'))
+        if reference:
+            conditions.append(reference)
+        offers.append(dict(name=name, brand=plain_text(details.get('brand')),
+            volume=plain_text(details.get('packageInformation')), description=plain_text(details.get('customerInformation')),
+            image=image, price=price, ordinary=ordinary, member=member, member_label='Stammis',
+            eligibility='Självscanning' if self_scan else ('LOYALTY' if member else 'GENERAL'),
+            conditions=conditions, variants=variants if len(variants) > 1 else [],
+            search_extra=' '.join(variants), start=start, end=end.isoformat(), observed=today.isoformat(),
+            **ica_discount(row, store, price)))
+    return offers
+
+
+def ica_require_success(response):
+    if response is not None and response.status == 200:
+        return
+    delay = 60
+    if response is not None:
+        retry = response.headers.get('retry-after', '')
+        try:
+            delay = max(delay, int(retry))
+        except ValueError:
+            from email.utils import parsedate_to_datetime
+            try:
+                when = parsedate_to_datetime(retry)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=dt.timezone.utc)
+                delay = max(delay, int((when - dt.datetime.now(dt.timezone.utc)).total_seconds()) + 1)
+            except (ValueError, TypeError, OverflowError):
+                pass
+    error = ExtractionUnavailable('ICA:s erbjudanden är inte tillgängliga.', delay)
+    error.source_retry_after = delay
+    raise error
+
+
+def fetch_ica(store_key):
+    """One ordinary, resource-limited browser; no stealth, login or challenge solving."""
+    global ICA_ROBOTS, ICA_ROBOTS_SAVED
+    config = STORES[store_key]
+    if not ICA_BROWSER_LOCK.acquire(timeout=40):
+        raise ExtractionUnavailable('ICA hämtas redan. Försök igen om en stund.')
+    try:
+        from playwright.sync_api import sync_playwright
+        from urllib.robotparser import RobotFileParser
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(timeout=15000)
+            try:
+                context = browser.new_context(service_workers='block', java_script_enabled=False)
+                # Initial offer state and markup are inline. No product-image/analytics downloads.
+                context.route('**/*', lambda route: route.continue_() if (
+                    route.request.is_navigation_request() and route.request.frame == route.request.frame.page.main_frame
+                    and urllib.parse.urlsplit(route.request.url).scheme == 'https'
+                    and urllib.parse.urlsplit(route.request.url).netloc == 'www.ica.se') else route.abort())
+                page = context.new_page()
+                if ICA_ROBOTS is None or time.monotonic() - ICA_ROBOTS_SAVED >= 86400:
+                    response = page.goto('https://www.ica.se/robots.txt', wait_until='domcontentloaded', timeout=20000)
+                    ica_require_success(response)
+                    robots = RobotFileParser()
+                    robots.parse(response.text().splitlines())
+                    ICA_ROBOTS, ICA_ROBOTS_SAVED = robots, time.monotonic()
+                if not ICA_ROBOTS.can_fetch('FoodSale', config['source']):
+                    raise ExtractionUnavailable('ICA tillåter inte denna hämtning.')
+                response = page.goto(config['source'], wait_until='domcontentloaded', timeout=20000)
+                ica_require_success(response)
+                if page.url.rstrip('/') != config['source'].rstrip('/'):
+                    raise ValueError('ICA öppnade en annan sida.')
+                rows = ica_page_data(response.text(), None, config)
+            finally:
+                browser.close()
+        now = dt.datetime.now(STOCKHOLM)
+        return dict(store=config['name'], address=config['address'], source=config['source'],
+                    fetchedAt=now.isoformat(), today=now.date().isoformat(), sourceResults=len(rows),
+                    offers=normalize_ica(rows, config, now.date()),
+                    note='ICA:s aktuella butikserbjudanden. Startdatum saknas hos källan; endast slutdatum visas. Personliga kuponger ingår inte.')
+    finally:
+        ICA_BROWSER_LOCK.release()
 
 
 def public_json(url, headers=None):
@@ -735,8 +1021,9 @@ def select_offers(offers, query='', mode='Alla erbjudanden', expiry='Alla slutda
     selected = []
     for offer in offers:
         end = dt.date.fromisoformat(offer['end'])
-        start = dt.date.fromisoformat(offer['start'])
-        if not start <= today <= end:
+        start = dt.date.fromisoformat(offer['start']) if offer.get('start') else None
+        if ((start is not None and today < start) or today > end
+                or (start is None and offer.get('observed') != today.isoformat())):
             continue
         if mode in ('Willys Plus', 'Medlemspriser') and not offer['member']:
             continue
@@ -783,11 +1070,12 @@ def card(offer, today=None):
         conditions += '<details><summary>Visa ' + str(len(variants)) + ' sorter</summary>' + ''.join(
             '<div>' + escape(v) + '</div>' for v in variants) + '</details>'
     brand = ' · '.join(filter(None, [offer['brand'], offer['volume']]))
+    dates = (display_date(offer['start']) + ' – ' + display_date(offer['end'])) if offer.get('start') else ('Gäller till ' + display_date(offer['end']))
     return f'''<article class="offer-card"><div class="badges">{membership}{urgency}</div>
 <div class="offer-picture">{image}</div><div class="offer-brand">{escape(brand)}</div>
 <h2>{escape(offer['name'])}</h2><p class="offer-description">{escape(offer['description'])}</p>
 <div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{ordinary}{saving_label}</div>
-<div class="conditions">{conditions}</div><div class="offer-dates">{display_date(offer['start'])} – {display_date(offer['end'])}</div></article>'''
+<div class="conditions">{conditions}</div><div class="offer-dates">{dates}</div></article>'''
 
 
 def read_public(url, headers=None):
@@ -993,7 +1281,7 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
 <header class="topbar"><a class="brand" href="/" aria-label="Food Sale startsida"><span class="brand-mark">fs.</span><span>Food Sale <small>HALMSTAD</small></span></a>
 <button id="theme" class="quiet" type="button" aria-label="Byt till mörkt tema">Mörkt tema</button></header>
 <main id="main" tabindex="-1">
-<section class="hero"><div><h1>Veckans fynd,<br>nära dig.</h1><p>Alla erbjudanden på ett ställe. Hitta det som passar dig.</p></div><div class="hero-aside"><span class="location-dot"></span> Halmstad, Sverige<br><small id="coverage">12 produktvyer · 7 officiella sidor</small></div></section>
+<section class="hero"><div><h1>Veckans fynd,<br>nära dig.</h1><p>Alla erbjudanden på ett ställe. Hitta det som passar dig.</p></div><div class="hero-aside"><span class="location-dot"></span> Halmstad, Sverige<br><small id="coverage">19 butiker · välj butik för aktuella erbjudanden</small></div></section>
 <section class="store-bar" aria-label="Butik"><div class="store-picker"><label for="store">Välj din butik</label><select id="store"><option value="willys-oster">Willys Halmstad Öster</option><option value="willys-flygstaden">Willys Halmstad Flygstaden</option><option value="hemkop-c">Hemköp Halmstad C</option><option value="coop-stora">Stora Coop Halmstad</option><option value="coop-gamletull">Coop Gamletull Halmstad</option><option value="coop-flygaregatan">Coop Flygaregatan</option><option value="coop-furuvagen">Coop Furuvägen</option><option value="coop-fyllinge">Coop Fyllinge</option><option value="xtra-snostorp">X:-Tra Snöstorpsvägen</option><option value="lidl-torpaledsvagen">Lidl Torpaledsvägen</option><option value="lidl-gesallgatan">Lidl Gesällgatan</option><option value="lidl-tegelbruket">Lidl Tegelbruket</option><option value="ica-hogskolan">Maxi ICA Stormarknad Högskolan · Officiell sida</option><option value="ica-flygstaden">Maxi ICA Stormarknad Flygstaden · Officiell sida</option><option value="ica-vallas">ICA Supermarket Vallås · Officiell sida</option><option value="ica-sondrum">ICA Supermarket Söndrum · Officiell sida</option><option value="ica-frosakull">ICA Nära Frösakull · Officiell sida</option><option value="citygross">City Gross Halmstad · Officiell sida</option><option value="tempo-backagard">Tempo Halmstad Bäckagård · Officiell sida</option></select></div><div class="store-context"><strong id="store-name"></strong><span id="address"></span></div><a id="source" class="source-link" target="_blank" rel="noopener noreferrer">Butikens erbjudanden <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14"/><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg></a></section>
 <section id="summary" class="summary" aria-label="Översikt"><div class="summary-item"><strong id="total">—</strong><span>aktuella erbjudanden</span></div><div class="summary-item"><strong id="members">—</strong><span>medlemspriser</span></div><div class="summary-item"><strong id="ending">—</strong><span>slutar idag</span></div></section>
 <form id="filters" class="filters" role="search">
@@ -1008,13 +1296,13 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
 <div class="results-bar"><strong id="results-count" aria-live="polite">Hämtar erbjudanden…</strong><span id="freshness"></span></div>
 <div id="grid" class="offer-grid" aria-busy="true"></div>
 <div id="empty" class="empty" hidden><strong>Inga matchningar just nu</strong><p>Prova ett annat sökord eller återställ filtren.</p></div>
-<div id="official" class="empty" hidden><h2>Erbjudandena finns hos butiken</h2><p>Den här butiken har ännu ingen produktlista i Food Sale. Sökning och sortering är därför inte tillgängliga här.</p><a id="official-source" class="button-link" target="_blank" rel="noopener noreferrer">Öppna butikens erbjudanden <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14"/><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg></a></div>
+<div id="official" class="empty" hidden><h2>Erbjudandena finns hos butiken</h2><p>Den här butiken har ännu ingen produktlista i Food Sale. Sökning och sortering är därför inte tillgängliga här.</p><div id="leaflets" aria-live="polite"></div><a id="official-source" class="button-link" target="_blank" rel="noopener noreferrer">Öppna butikens erbjudanden <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14"/><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg></a></div>
 <div class="pagination"><p id="page-note" class="caption" role="status" aria-live="polite"></p><button id="more" type="button" hidden>Visa fler</button><button id="all" class="quiet" type="button" hidden>Visa alla</button></div>
 </main>
 <footer class="footnote"><strong>Food Sale / Halmstad</strong><p>Offentliga butikserbjudanden. Medlemspriser kräver medlemskap hos respektive kedja. Personliga kuponger och lokalt lagersaldo ingår inte. Kontrollera alltid pris och villkor hos butiken. Fristående visare.</p></footer>
 <noscript><p>Aktivera JavaScript för att söka och filtrera erbjudanden. Butikerna finns också via sina officiella erbjudandesidor.</p></noscript>
 </div>
-<script id="catalogue" type="application/json">{"willys-oster": {"name": "Willys Halmstad Öster", "provider": "axfood", "address": "Laholmsvägen 37", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2236"}, "willys-flygstaden": {"name": "Willys Halmstad Flygstaden", "provider": "axfood", "address": "Kundvägen 4", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2137"}, "hemkop-c": {"name": "Hemköp Halmstad C", "provider": "axfood", "address": "Brogatan 14–16", "member": "Klubb Hemköp", "source": "https://www.hemkop.se/butik/4245"}, "coop-stora": {"name": "Stora Coop Halmstad", "provider": "coop", "address": "Prästvägen 1", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/stora-coop/stora-coop-halmstad/"}, "coop-gamletull": {"name": "Coop Gamletull Halmstad", "provider": "coop", "address": "Gamletullsgatan 20", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-gamletull-halmstad/"}, "coop-flygaregatan": {"name": "Coop Flygaregatan", "provider": "coop", "address": "Flygaregatan 12", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-flygaregatan/"}, "coop-furuvagen": {"name": "Coop Furuvägen", "provider": "coop", "address": "Furuvägen 63", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-furuvagen/"}, "coop-fyllinge": {"name": "Coop Fyllinge", "provider": "coop", "address": "Fyllingevägen 2", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-fyllinge/"}, "xtra-snostorp": {"name": "X:-Tra Snöstorpsvägen", "provider": "coop", "address": "Snöstorpsvägen 109", "member": "Coop-medlem", "source": "https://x-tra.se/butiker/snoestorpsvaegen"}, "lidl-torpaledsvagen": {"name": "Lidl Torpaledsvägen", "provider": "lidl", "address": "Torpaledsvägen 4", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/torpaledsvaegen-4/"}, "lidl-gesallgatan": {"name": "Lidl Gesällgatan", "provider": "lidl", "address": "Gesällgatan 3", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/gesaellgatan-3/"}, "lidl-tegelbruket": {"name": "Lidl Tegelbruket", "provider": "lidl", "address": "Tegelbruket 1", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/tegelbruket-1/"}, "ica-hogskolan": {"name": "Maxi ICA Stormarknad Högskolan", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/"}, "ica-flygstaden": {"name": "Maxi ICA Stormarknad Flygstaden", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/"}, "ica-vallas": {"name": "ICA Supermarket Vallås", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/"}, "ica-sondrum": {"name": "ICA Supermarket Söndrum", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/"}, "ica-frosakull": {"name": "ICA Nära Frösakull", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/"}, "citygross": {"name": "City Gross Halmstad", "provider": "official", "address": "Stormgatan 14", "source": "https://www.citygross.se/butiker/halmstad"}, "tempo-backagard": {"name": "Tempo Halmstad Bäckagård", "provider": "official", "address": "Akvarellgränd 1", "source": "https://www.tempo.se/butiker/tempo-halmstad-backagard/"}}</script>
+<script id="catalogue" type="application/json">{"willys-oster": {"name": "Willys Halmstad Öster", "provider": "axfood", "address": "Laholmsvägen 37", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2236"}, "willys-flygstaden": {"name": "Willys Halmstad Flygstaden", "provider": "axfood", "address": "Kundvägen 4", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2137"}, "hemkop-c": {"name": "Hemköp Halmstad C", "provider": "axfood", "address": "Brogatan 14–16", "member": "Klubb Hemköp", "source": "https://www.hemkop.se/butik/4245"}, "coop-stora": {"name": "Stora Coop Halmstad", "provider": "coop", "address": "Prästvägen 1", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/stora-coop/stora-coop-halmstad/"}, "coop-gamletull": {"name": "Coop Gamletull Halmstad", "provider": "coop", "address": "Gamletullsgatan 20", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-gamletull-halmstad/"}, "coop-flygaregatan": {"name": "Coop Flygaregatan", "provider": "coop", "address": "Flygaregatan 12", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-flygaregatan/"}, "coop-furuvagen": {"name": "Coop Furuvägen", "provider": "coop", "address": "Furuvägen 63", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-furuvagen/"}, "coop-fyllinge": {"name": "Coop Fyllinge", "provider": "coop", "address": "Fyllingevägen 2", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-fyllinge/"}, "xtra-snostorp": {"name": "X:-Tra Snöstorpsvägen", "provider": "coop", "address": "Snöstorpsvägen 109", "member": "Coop-medlem", "source": "https://x-tra.se/butiker/snoestorpsvaegen"}, "lidl-torpaledsvagen": {"name": "Lidl Torpaledsvägen", "provider": "lidl", "address": "Torpaledsvägen 4", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/torpaledsvaegen-4/"}, "lidl-gesallgatan": {"name": "Lidl Gesällgatan", "provider": "lidl", "address": "Gesällgatan 3", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/gesaellgatan-3/"}, "lidl-tegelbruket": {"name": "Lidl Tegelbruket", "provider": "lidl", "address": "Tegelbruket 1", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/tegelbruket-1/"}, "ica-hogskolan": {"name": "Maxi ICA Stormarknad Högskolan", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/"}, "ica-flygstaden": {"name": "Maxi ICA Stormarknad Flygstaden", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/"}, "ica-vallas": {"name": "ICA Supermarket Vallås", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/"}, "ica-sondrum": {"name": "ICA Supermarket Söndrum", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/"}, "ica-frosakull": {"name": "ICA Nära Frösakull", "provider": "ica", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/"}, "citygross": {"name": "City Gross Halmstad", "provider": "official", "address": "Stormgatan 14", "source": "https://www.citygross.se/butiker/halmstad"}, "tempo-backagard": {"name": "Tempo Halmstad Bäckagård", "provider": "official", "address": "Akvarellgränd 1", "source": "https://www.tempo.se/butiker/tempo-halmstad-backagard/"}}</script>
 <script>'use strict';
 const catalogue=JSON.parse(document.getElementById('catalogue').textContent);
 const $=id=>document.getElementById(id);
@@ -1031,8 +1319,24 @@ function storeDetails(){const config=catalogue[$('store').value];$('store-name')
 function schedule(seconds){clearTimeout(poll);poll=setTimeout(()=>{if(document.visibilityState==='visible')load();else schedule(60)},seconds*1000)}
 async function load(force=false){
  clearTimeout(poll);clearTimeout(debounce);if(controller)controller.abort();const requestId=++sequence;const store=$('store').value;
- if(activeStore!==store){clearCards();notice('');$('note').hidden=true;$('sort-note').hidden=true;activeStore=store}saveUrl();
- if(storeDetails()){clearCards();$('grid').setAttribute('aria-busy','false');notice('');return}
+ if(activeStore!==store){clearCards();notice('');$('note').hidden=true;$('sort-note').hidden=true;activeStore=store;$('leaflets').replaceChildren()}saveUrl();
+ if(storeDetails()){
+  clearCards();$('grid').setAttribute('aria-busy','false');notice('');$('leaflets').replaceChildren();
+  if(store==='citygross'){
+   controller=new AbortController();$('leaflets').textContent='Hämtar aktuella reklamblad…';
+   try{
+    const response=await fetch('/api/leaflets/citygross',{signal:controller.signal,cache:'no-store'});
+    const data=await response.json();if(requestId!==sequence)return;
+    if(!response.ok)throw new Error();
+    $('leaflets').replaceChildren();
+    const note=document.createElement('p');note.textContent='Aktuella reklamblad. Produktsökning och prissortering är ännu inte tillgängliga.';$('leaflets').append(note);
+    for(const leaflet of data.leaflets){const paragraph=document.createElement('p'),link=document.createElement('a');link.className='button-link';link.href=leaflet.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent=leaflet.title;paragraph.append(link);const dates=document.createElement('p');dates.textContent=leaflet.description||`${leaflet.start} – ${leaflet.end}`;paragraph.append(dates);$('leaflets').append(paragraph)}
+    const status=document.createElement('p');status.textContent=data.message;$('leaflets').append(status);
+    schedule(300);
+   }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;$('leaflets').textContent='Reklambladen kunde inte hämtas. Använd butikens officiella länk.';schedule(60)}
+  }
+  return
+ }
  if(fetchedAt&&Date.now()-new Date(fetchedAt).getTime()>=600000)clearCards();
  loading();if(!fetchedAt)notice('Hämtar butikens erbjudanden…');
  controller=new AbortController();const query=new URLSearchParams({store,q:$('search').value,membership:$('membership').value,expiry:$('expiry').value,sort:$('sort').value,limit:String(limit)});
@@ -1041,7 +1345,7 @@ async function load(force=false){
   const response=await fetch('/api/offers?'+query,{method:force?'POST':'GET',headers:force?{'X-FoodSale-Request':'1'}:{},signal:controller.signal,cache:'no-store'});
   const data=await response.json();if(requestId!==sequence)return;
   if(!response.ok||data.status!=='ok')throw new Error(data.message||'Erbjudandena kunde inte hämtas. Försök igen om en stund.');
-  $('grid').innerHTML=data.cards;$('total').textContent=data.total;$('members').textContent=data.members;$('ending').textContent=data.ending;
+  $('grid').innerHTML=data.cards;if(catalogue[store].provider==='ica'&&data.shown>0)$('store').selectedOptions[0].textContent=catalogue[store].name;$('official').hidden=true;$('summary').hidden=false;$('filters').hidden=false;$('total').textContent=data.total;$('members').textContent=data.members;$('ending').textContent=data.ending;
   $('results-count').textContent=`${data.matches} av ${data.total} erbjudanden`;
   fetchedAt=data.fetchedAt;const date=new Date(fetchedAt);$('freshness').textContent='Hämtat '+date.toLocaleString('sv-SE',{timeZone:'Europe/Stockholm',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+' · svensk tid';
   $('note').textContent=data.note||'';$('note').hidden=!data.note;$('sort-note').hidden=!['discount','saving'].includes($('sort').value);
@@ -1050,7 +1354,7 @@ async function load(force=false){
   $('page-note').textContent=data.hasMore?`Visar ${data.shown} av ${data.matches}. Sökningen omfattar alla erbjudanden.`:'';
   $('more').textContent='Visa 48 till';$('all').textContent=`Visa alla ${data.matches}`;
   schedule(data.refreshing?3:60);
- }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;clearCards();notice(error.message||'Anslutningen misslyckades. Försök igen.','error');schedule(30)}
+ }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;clearCards();if(catalogue[store].provider==='ica'){$('official').hidden=false;$('summary').hidden=true;$('filters').hidden=true;$('store').selectedOptions[0].textContent=catalogue[store].name+' · Officiell sida'}notice(error.message||'Anslutningen misslyckades. Försök igen.','error');schedule(60)}
  finally{if(requestId===sequence){$('grid').setAttribute('aria-busy','false');$('refresh').disabled=false;$('refresh').querySelector('.button-label').textContent='Uppdatera'}}
 }
 $('filters').addEventListener('submit',event=>{event.preventDefault();limit=48;load()});
@@ -1063,7 +1367,7 @@ document.addEventListener('visibilitychange',()=>{if(document.visibilityState===
 </script>
 </body></html>
 """
-CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-wwI7wDV6BKjkH0SNU+KMMgdlN6E6mXp1Xu7EifBCFTA='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-/AkDCmVjFcGS0Zf1wS161tUDre8SNNRrGYh1Rj5DpsY=' 'sha256-LH/hwrSLBoETXNNWSwDuXKFjkizMWVQKoo51hEy9Aw0='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 MEMBERSHIP = {'all': 'Alla erbjudanden', 'general': 'Utan medlemskrav', 'member': 'Medlemspriser'}
 EXPIRY = {'all': 'Alla slutdatum', 'today': 'Slutar idag', 'soon': 'Inom 3 dagar'}
@@ -1081,8 +1385,10 @@ def store_snapshot(store_key, force=False):
         loader = lambda: fetch_lidl(store_key)
     else:
         key = (store_key, today)
-        loader = lambda: fetch_coop(store_key) if config['provider'] == 'coop' else fetch_offers(store_key)
-    snapshot = offer_cache.get(key, loader, force=force)
+        loader = lambda: (fetch_ica(store_key) if config['provider'] == 'ica' else
+                          fetch_coop(store_key) if config['provider'] == 'coop' else fetch_offers(store_key))
+    cache = ica_offer_cache if config['provider'] == 'ica' else offer_cache
+    snapshot = cache.get(key, loader, force=force)
     age = (dt.datetime.now(STOCKHOLM) - dt.datetime.fromisoformat(snapshot.value['fetchedAt'])).total_seconds()
     if age >= 600:
         raise ExtractionUnavailable('De sparade priserna är för gamla. Kontrollera butikens officiella erbjudanden eller försök igen.')
@@ -1094,6 +1400,7 @@ async def lifespan(application):
     yield
     # All network calls have finite timeouts; finish workers on graceful shutdown.
     offer_cache.close()
+    ica_offer_cache.close()
 
 
 app = FastAPI(title='Food Sale · Halmstad', version='2.0', lifespan=lifespan,
@@ -1115,6 +1422,32 @@ async def response_headers(request: Request, call_next):
 async def index():
     # The shell renders without waiting for any grocery source.
     return HTMLResponse(PAGE)
+
+
+@app.get('/api/leaflets/citygross')
+def city_leaflets():
+    """A separate, honestly labelled fallback, not a product-offers integration."""
+    try:
+        now = dt.datetime.now(STOCKHOLM)
+        snapshot = offer_cache.get(('city-leaflets', now.date().isoformat()), fetch_city_leaflets)
+        now = dt.datetime.now(STOCKHOLM)
+        value = snapshot.value
+        age = (now - dt.datetime.fromisoformat(value['fetchedAt'])).total_seconds()
+        if age >= 600:
+            raise ExtractionUnavailable('Reklambladen är för gamla.')
+        leaflets = [row for row in value['leaflets'] if row['start'] <= now.date().isoformat() <= row['end']]
+        message = 'Kontrollerat ' + dt.datetime.fromisoformat(value['fetchedAt']).strftime('%H:%M') + ' · svensk tid.'
+        if snapshot.failed:
+            message += ' Uppdateringen misslyckades; visar nyligen sparade länkar.'
+        elif snapshot.stale:
+            message += ' Visar sparade länkar medan en ny kontroll pågår.'
+        if not leaflets:
+            message += ' Inga aktuella reklamblad hittades.'
+        return dict(leaflets=leaflets, fetchedAt=value['fetchedAt'], stale=snapshot.stale,
+                    refreshing=snapshot.refreshing, refreshFailed=snapshot.failed, message=message)
+    except Exception:
+        return JSONResponse({'message': 'Reklambladen kunde inte hämtas. Öppna butikens officiella sida.'},
+                            status_code=503, headers={'Retry-After': '60'})
 
 
 @app.get('/healthz')
