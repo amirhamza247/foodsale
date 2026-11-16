@@ -836,67 +836,180 @@ PAGE = r"""<!doctype html>
 <script>(()=>{let theme;try{theme=new URLSearchParams(location.search).get('theme')||localStorage.getItem('foodsale-theme')}catch{}if(!['light','dark'].includes(theme))theme=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=theme})();
 </script>
 <style>
-.stApp{background:var(--viewer-bg);color:var(--viewer-text)}
-.block-container{max-width:1390px;padding:5rem 3rem 3rem}
-.hero{padding:0 0 16px;border-bottom:1px solid var(--viewer-border);margin-bottom:4px}
-.eyebrow{display:flex;align-items:center;gap:10px;font-size:11px;letter-spacing:.17em;font-weight:800;text-transform:uppercase;color:var(--viewer-accent)}
-.brand-mark{background:#a12d26;color:white;border-radius:8px;letter-spacing:-.04em;padding:7px 10px;font-size:17px}
-.hero h1{font-size:clamp(28px,3.5vw,44px);font-weight:750;letter-spacing:-.055em;line-height:1.15;margin:8px 0 10px;color:var(--viewer-text)}
-.hero p{font-size:14px;color:var(--viewer-muted);margin:0}
-.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 4px}
-.summary-item{padding:10px 16px;border:1px solid var(--viewer-border);background:var(--viewer-card);border-radius:12px;display:flex;align-items:baseline;gap:10px}
-.summary-item strong{font-size:25px;letter-spacing:-.04em;color:var(--viewer-text)}
-.summary-item span{font-size:12px;color:var(--viewer-muted)}
-.results-bar{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:20px 0 16px;font-size:12px;color:var(--viewer-muted)}
-.results-bar strong{color:var(--viewer-text);font-size:14px}
-.offer-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:18px}
-.offer-card{background:var(--viewer-card);border:1px solid var(--viewer-border);border-radius:16px;padding:18px;display:flex;flex-direction:column;min-width:0;transition:border-color .15s}
-.offer-card:hover{border-color:var(--viewer-accent)}
-.badges{display:flex;align-items:flex-start;flex-wrap:wrap;gap:5px;min-height:24px}.badge{padding:4px 7px;border-radius:5px;font-size:10px;font-weight:750;letter-spacing:.02em;color:var(--viewer-muted);background:var(--viewer-bg)}
-.badge.plus{color:var(--viewer-accent);border:1px solid var(--viewer-border)}.badge.ending{background:var(--viewer-accent);color:var(--viewer-bg)}
-.offer-picture{height:165px;display:flex;align-items:center;justify-content:center;background:white;border-radius:10px;margin:14px 0 16px;color:#62625d;font-size:12px;padding:10px}
-.offer-picture img{max-width:100%;max-height:145px;object-fit:contain}
-.offer-brand{font-size:10px;letter-spacing:.03em;text-transform:uppercase;color:var(--viewer-muted);line-height:1.6}
-.offer-card h2{font-size:19px;font-weight:700;margin:6px 0 8px;line-height:1.3;color:var(--viewer-text);letter-spacing:-.025em;overflow-wrap:anywhere}
-.offer-description{font-size:12px;color:var(--viewer-muted);line-height:1.6;margin:0 0 18px}
-.price-block{margin-top:auto}.offer-price{font-size:28px;font-weight:800;letter-spacing:-.045em;color:var(--viewer-accent);line-height:1.3;overflow-wrap:anywhere}
-.ordinary{font-size:11px;color:var(--viewer-muted);margin:6px 0 12px}
-.conditions{font-size:11px;line-height:1.7;color:var(--viewer-muted)}
-.offer-dates{padding-top:12px;margin-top:14px;border-top:1px solid var(--viewer-border);font-size:10px;color:var(--viewer-muted);line-height:1.5}
-.footnote{font-size:11px;color:var(--viewer-muted);line-height:1.8;padding-top:24px;margin-top:24px;border-top:1px solid var(--viewer-border)}
-@media(max-width:640px){.block-container{padding:4.5rem 1rem 2rem}.hero{padding-bottom:20px}.hero h1{font-size:34px}.summary{gap:6px}.summary-item{padding:10px;display:block}.summary-item strong{font-size:22px;display:block}.summary-item span{font-size:10px}.offer-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.offer-card{padding:12px}.offer-picture{height:125px;padding:6px}.offer-picture img{max-height:113px}.offer-card h2{font-size:16px}.offer-price{font-size:23px}.badges{min-height:40px}.badge{font-size:9px}}
-@media(max-width:340px){.offer-grid{grid-template-columns:1fr}}
-@media(prefers-reduced-motion:reduce){.offer-card{transition:none}}
-:root{--viewer-bg:#f6f5f1;--viewer-card:#fff;--viewer-text:#222;--viewer-muted:#62625d;--viewer-border:#d3d1c9;--viewer-accent:#a12d26;--viewer-input:#fff;color-scheme:light}
-:root[data-theme=dark]{--viewer-bg:#17191d;--viewer-card:#22262c;--viewer-text:#f1f2f5;--viewer-muted:#b8bfc9;--viewer-border:#414854;--viewer-accent:#ffaaa3;--viewer-input:#252a32;color-scheme:dark}
-*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--viewer-bg);color:var(--viewer-text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:var(--viewer-accent)}button,a,input,select{touch-action:manipulation}:focus-visible{outline:3px solid var(--viewer-accent);outline-offset:3px}button,select{cursor:pointer}button,.button-link{padding:11px 16px;border:1px solid var(--viewer-border);border-radius:9px;background:var(--viewer-card);color:var(--viewer-text);font-weight:650;text-decoration:none}button:hover,.button-link:hover{border-color:var(--viewer-accent)}button:disabled{cursor:wait;opacity:.6}.quiet{background:transparent}.block-container{margin:auto;padding:30px 40px 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:48px}.brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--viewer-text);font-size:18px;font-weight:750;letter-spacing:-.035em}.brand small{display:block;font-size:9px;letter-spacing:.2em;font-weight:600;color:var(--viewer-muted)}.hero{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:32px;margin-bottom:24px}.hero h1{font-size:clamp(34px,5.5vw,64px);line-height:1.06;margin:16px 0}.eyebrow{font-size:10px;letter-spacing:.18em}.hero-aside{font-size:13px;line-height:1.8;text-align:right;color:var(--viewer-muted)}.hero-aside small{font-size:11px}.location-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--viewer-accent);margin-right:6px}.store-bar{display:flex;align-items:center;gap:24px;padding:20px;border-radius:14px;background:var(--viewer-card);border:1px solid var(--viewer-border);margin-bottom:20px}.store-picker{width:360px;max-width:100%}label{display:block;font-size:11px;font-weight:700;letter-spacing:.025em;margin-bottom:7px;color:var(--viewer-muted)}input,select{width:100%;min-width:0;padding:12px;border:1px solid var(--viewer-border);border-radius:8px;background:var(--viewer-input);color:var(--viewer-text);min-height:45px}input::placeholder{color:var(--viewer-muted)}.store-context{display:flex;flex-direction:column;font-size:13px;gap:3px}.store-context span{color:var(--viewer-muted);font-size:12px}.source-link{margin-left:auto;font-size:12px;white-space:nowrap}.summary{margin-bottom:24px}.filters{display:grid;grid-template-columns:2fr 1.2fr 1.1fr 1.6fr;gap:14px;align-items:end}.actions{display:flex;gap:8px;grid-column:1/-1;justify-content:flex-end}.caption{font-size:12px;color:var(--viewer-muted);line-height:1.7;margin:14px 0}.notice{margin:16px 0;padding:13px 16px;border-radius:9px;border:1px solid var(--viewer-border);background:var(--viewer-card);font-size:13px}.notice.warning{border-left:4px solid #bf8c31}.notice.error{border-left:4px solid var(--viewer-accent)}.empty{text-align:center;border:1px dashed var(--viewer-border);border-radius:14px;padding:50px 20px;color:var(--viewer-muted)}.empty h2,.empty strong{color:var(--viewer-text)}.empty .eyebrow{justify-content:center}.empty p{margin-bottom:28px}.pagination{text-align:center;padding:20px}.pagination button{margin:4px}.skeleton{border-radius:16px;border:1px solid var(--viewer-border);background:var(--viewer-card);padding:18px;height:370px}.skeleton div{height:175px;background:var(--viewer-bg);border-radius:10px;margin:25px 0}.skeleton span{display:block;height:16px;width:70%;margin:16px 0;background:var(--viewer-bg);border-radius:4px}.skeleton span:last-child{width:40%}.skip{position:absolute;left:16px;top:-100px;background:var(--viewer-card);padding:12px;z-index:1}.skip:focus{top:10px}details summary{cursor:pointer;color:var(--viewer-accent)}
-@media(max-width:900px){.store-bar{flex-wrap:wrap;gap:14px}.store-picker{width:100%}.store-context{flex:1}.filters{grid-template-columns:1fr 1fr}.search-field{grid-column:1/-1}.hero-aside{display:none}}
-@media(max-width:640px){.block-container{padding:20px 16px}.topbar{margin-bottom:30px}.hero{padding-bottom:24px}.hero h1{font-size:42px}.store-bar{padding:14px}.source-link{white-space:normal}.store-context{min-width:150px}.summary{gap:7px}.summary-item span{font-size:10px}.filters{gap:12px}.actions{justify-content:stretch}.actions button{flex:1}select,input{font-size:16px}.results-bar{gap:8px}.offer-card{padding:12px}.offer-price{font-size:23px}}
+:root {
+  color-scheme: light;
+  --viewer-bg: #f6f5f1; --viewer-card: #ffffff; --viewer-text: #222222;
+  --viewer-muted: #62625d; --viewer-border: #d3d1c9; --viewer-control: #88877f;
+  --viewer-accent: #a12d26; --viewer-input: #ffffff; --viewer-hover: #edece6;
+  --viewer-warning-bg: #fff3dc; --viewer-warning-text: #66480e;
+  --viewer-error-bg: #fff1ee; --viewer-error-text: #a12d26;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px;
+}
+:root[data-theme=dark] {
+  color-scheme: dark;
+  --viewer-bg: #17191d; --viewer-card: #22262c; --viewer-text: #f1f2f5;
+  --viewer-muted: #b8bfc9; --viewer-border: #414854; --viewer-control: #737e8b;
+  --viewer-accent: #ffaaa3; --viewer-input: #252a32; --viewer-hover: #303640;
+  --viewer-warning-bg: #342a17; --viewer-warning-text: #f3ce82;
+  --viewer-error-bg: #352320; --viewer-error-text: #ffb4a9;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { scroll-padding-top: var(--space-4); }
+body { margin: 0; background: var(--viewer-bg); color: var(--viewer-text); font: 1rem/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+button, input, select { font: inherit; }
+a { color: var(--viewer-accent); text-underline-offset: .2em; text-decoration-thickness: 1px; }
+button, a, input, select { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 2px solid var(--viewer-accent); outline-offset: 3px; }
+::selection { color: var(--viewer-card); background: var(--viewer-accent); }
+input { caret-color: var(--viewer-accent); }
+button, select { cursor: pointer; }
+button, .button-link {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+  min-height: 44px; padding: 10px var(--space-4); border: 1px solid var(--viewer-control);
+  border-radius: 8px; background: var(--viewer-card); color: var(--viewer-text);
+  font-size: .875rem; font-weight: 650; text-decoration: none;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+}
+button:hover:not(:disabled), .button-link:hover { background: var(--viewer-hover); border-color: var(--viewer-accent); }
+button:active:not(:disabled), .button-link:active { background: var(--viewer-hover); }
+button:disabled { cursor: wait; opacity: .6; }
+button.quiet { background: transparent; border-color: transparent; }
+button.quiet:hover:not(:disabled) { border-color: var(--viewer-border); }
+.icon { flex: none; width: 16px; height: 16px; vertical-align: middle; }
+.block-container { max-width: 1390px; margin: auto; padding: var(--space-8) 40px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-8); }
+.brand { display: inline-flex; align-items: center; gap: var(--space-3); min-height: 44px; color: var(--viewer-text); text-decoration: none; font-size: 1.125rem; font-weight: 750; letter-spacing: -.025em; }
+.brand-mark { padding: 6px 10px; border-radius: 8px; background: #a12d26; color: white; font-size: 1.25rem; letter-spacing: -.03em; }
+.brand small { display: block; margin-top: 1px; font-size: .6875rem; letter-spacing: .14em; font-weight: 650; color: var(--viewer-muted); }
+.hero { display: flex; justify-content: space-between; align-items: flex-end; gap: var(--space-6); padding-bottom: var(--space-8); margin-bottom: var(--space-6); border-bottom: 1px solid var(--viewer-border); }
+.hero h1 { margin: 0 0 var(--space-4); font-size: 3rem; line-height: 1.08; font-weight: 750; letter-spacing: -.03em; text-wrap: balance; }
+.hero p { max-width: 65ch; margin: 0; font-size: .9375rem; line-height: 1.6; color: var(--viewer-muted); }
+.hero-aside { flex: none; font-size: .8125rem; line-height: 1.9; text-align: right; color: var(--viewer-muted); }
+.hero-aside small { font-size: .75rem; }
+.location-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--viewer-accent); margin-right: 5px; }
+.store-bar { display: flex; align-items: center; gap: var(--space-6); padding: var(--space-4) var(--space-6); border: 1px solid var(--viewer-border); border-radius: 12px; background: var(--viewer-card); margin-bottom: var(--space-4); }
+.store-picker { flex: 0 1 360px; min-width: 0; max-width: 100%; }
+label { display: block; margin-bottom: 6px; font-size: .75rem; font-weight: 650; color: var(--viewer-muted); }
+input, select { width: 100%; min-width: 0; min-height: 46px; padding: 11px var(--space-3); border: 1px solid var(--viewer-control); border-radius: 8px; background: var(--viewer-input); color: var(--viewer-text); }
+select { padding-right: var(--space-8); }
+input::placeholder { color: var(--viewer-muted); opacity: 1; }
+.store-context { display: flex; flex: 1 1 160px; min-width: 0; flex-direction: column; gap: var(--space-1); font-size: .875rem; overflow-wrap: anywhere; }
+.store-context span { font-size: .8125rem; color: var(--viewer-muted); }
+.source-link { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: var(--space-2) 0; margin-left: auto; font-size: .8125rem; text-decoration: none; }
+.source-link:hover { text-decoration: underline; }
+.summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-4); margin-bottom: var(--space-6); }
+.summary-item { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--space-2); padding: var(--space-3) var(--space-4); border: 1px solid var(--viewer-border); border-radius: 12px; background: var(--viewer-card); }
+.summary-item strong { font-size: 1.625rem; line-height: 1.3; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.summary-item span { font-size: .8125rem; color: var(--viewer-muted); }
+.filters { display: grid; grid-template-columns: 2fr 1.2fr 1.1fr 1.6fr; gap: var(--space-4); align-items: end; }
+.filters > div { min-width: 0; }
+.actions { display: flex; gap: var(--space-2); grid-column: 1 / -1; justify-content: flex-end; }
+#refresh { min-width: 150px; }
+.caption { margin: var(--space-4) 0; font-size: .8125rem; line-height: 1.65; color: var(--viewer-muted); }
+.notice { margin: var(--space-4) 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--viewer-border); border-radius: 8px; background: var(--viewer-card); color: var(--viewer-text); font-size: .875rem; line-height: 1.6; }
+.notice.warning { background: var(--viewer-warning-bg); color: var(--viewer-warning-text); }
+.notice.error { background: var(--viewer-error-bg); color: var(--viewer-error-text); }
+.results-bar { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2) var(--space-4); margin: var(--space-6) 0 var(--space-4); font-size: .8125rem; color: var(--viewer-muted); }
+.results-bar strong { color: var(--viewer-text); font-size: .875rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+.offer-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(235px, 1fr)); gap: var(--space-4); }
+.offer-card { display: flex; flex-direction: column; min-width: 0; padding: var(--space-4); border: 1px solid var(--viewer-border); border-radius: 14px; background: var(--viewer-card); }
+.offer-card:focus-within { border-color: var(--viewer-accent); }
+.badges { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px; min-height: 26px; }
+.badge { padding: 3px 6px; border-radius: 4px; background: var(--viewer-bg); color: var(--viewer-muted); font-size: .6875rem; line-height: 1.55; font-weight: 650; }
+.badge.plus { color: var(--viewer-accent); }
+.badge.ending { background: var(--viewer-accent); color: var(--viewer-bg); }
+.offer-picture { display: flex; align-items: center; justify-content: center; height: 165px; padding: 10px; margin: var(--space-3) 0 var(--space-4); border-radius: 8px; background: white; color: #62625d; font-size: .8125rem; }
+.offer-picture img { max-width: 100%; max-height: 145px; object-fit: contain; }
+.offer-brand { font-size: .75rem; line-height: 1.6; color: var(--viewer-muted); overflow-wrap: anywhere; }
+.offer-card h2 { margin: 6px 0 var(--space-2); font-size: 1.125rem; line-height: 1.35; font-weight: 700; letter-spacing: -.015em; overflow-wrap: anywhere; }
+.offer-description { margin: 0 0 var(--space-4); font-size: .8125rem; line-height: 1.6; color: var(--viewer-muted); overflow-wrap: anywhere; }
+.offer-description:empty { display: none; }
+.price-block { margin-top: auto; }
+.offer-price { font-size: 1.75rem; line-height: 1.25; font-weight: 750; letter-spacing: -.025em; color: var(--viewer-accent); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ordinary { margin: 6px 0 var(--space-3); font-size: .75rem; line-height: 1.6; color: var(--viewer-muted); }
+.conditions { font-size: .75rem; line-height: 1.7; color: var(--viewer-muted); overflow-wrap: anywhere; }
+.conditions summary { display: list-item; min-height: 44px; padding: 11px 0; cursor: pointer; color: var(--viewer-accent); }
+.conditions details[open] summary { padding-bottom: 6px; }
+.offer-dates { padding-top: var(--space-3); margin-top: var(--space-3); border-top: 1px solid var(--viewer-border); font-size: .75rem; line-height: 1.6; color: var(--viewer-muted); font-variant-numeric: tabular-nums; }
+.empty { padding: 40px var(--space-6); border: 1px dashed var(--viewer-border); border-radius: 12px; color: var(--viewer-muted); text-align: center; }
+.empty h2, .empty strong { color: var(--viewer-text); }
+.empty h2 { font-size: 1.375rem; margin: 0 0 var(--space-3); }
+.empty p { max-width: 65ch; margin: var(--space-2) auto var(--space-6); font-size: .9375rem; }
+.pagination { padding: var(--space-6) 0; text-align: center; }
+.pagination button { margin: var(--space-1); }
+.skeleton { min-width: 0; height: 370px; padding: var(--space-4); border: 1px solid var(--viewer-border); border-radius: 14px; background: var(--viewer-card); }
+.skeleton div { height: 165px; margin: var(--space-8) 0 var(--space-6); border-radius: 8px; background: var(--viewer-bg); }
+.skeleton span { display: block; height: 16px; width: 70%; margin: var(--space-4) 0; border-radius: 4px; background: var(--viewer-bg); }
+.skeleton span:last-child { width: 40%; }
+.footnote { margin-top: var(--space-6); padding-top: var(--space-6); border-top: 1px solid var(--viewer-border); font-size: .8125rem; line-height: 1.7; color: var(--viewer-muted); }
+.footnote p { max-width: 75ch; }
+.skip { position: absolute; left: var(--space-4); top: -100px; z-index: 1; padding: var(--space-3); border-radius: 6px; background: var(--viewer-card); }
+.skip:focus { top: 10px; }
+@media (max-width: 1000px) {
+  .store-bar { flex-wrap: wrap; gap: var(--space-3) var(--space-6); }
+  .store-picker { flex-basis: 100%; }
+  .filters { grid-template-columns: 1fr 1fr; }
+  .search-field { grid-column: 1 / -1; }
+  .hero-aside { display: none; }
+}
+@media (max-width: 640px) {
+  .block-container { padding: var(--space-6) var(--space-4); }
+  .topbar { margin-bottom: var(--space-6); }
+  .hero { padding-bottom: var(--space-6); }
+  .hero h1 { font-size: 2.5rem; }
+  .hero p { font-size: .875rem; }
+  .store-bar { padding: var(--space-4); }
+  .source-link { margin-left: 0; }
+  .summary { gap: var(--space-2); }
+  .summary-item { display: block; padding: var(--space-3) 10px; }
+  .summary-item strong { display: block; font-size: 1.5rem; margin-bottom: var(--space-1); }
+  .summary-item span { display: block; font-size: .75rem; line-height: 1.45; }
+  .filters { gap: var(--space-3); }
+  .actions { justify-content: stretch; }
+  .actions button { flex: 1; }
+  input, select { font-size: 1rem; }
+  .offer-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
+  .offer-card { padding: var(--space-3); }
+  .offer-picture { height: 130px; padding: 6px; margin: var(--space-3) 0; }
+  .offer-picture img { max-height: 118px; }
+  .offer-card h2 { font-size: 1rem; }
+  .offer-price { font-size: 1.5rem; }
+}
+@media (max-width: 359px) {
+  .offer-grid { grid-template-columns: minmax(0, 1fr); }
+  .brand { gap: var(--space-2); }
+  #theme { padding: 10px var(--space-2); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }
+}
 </style>
 </head>
 <body>
-<a class="skip" href="#filters">Hoppa till erbjudanden</a>
+<a class="skip" href="#main">Hoppa till erbjudanden</a>
 <div class="block-container">
 <header class="topbar"><a class="brand" href="/" aria-label="Food Sale startsida"><span class="brand-mark">fs.</span><span>Food Sale <small>HALMSTAD</small></span></a>
-<button id="theme" class="quiet" type="button" aria-label="Byt till mörkt tema" aria-pressed="false">Mörkt tema</button></header>
-<main>
-<section class="hero"><div><p class="eyebrow">DIN LOKALA VECKOKOLL</p><h1>Veckans fynd,<br>nära dig.</h1><p>Alla erbjudanden på ett ställe. Hitta det som passar dig.</p></div><div class="hero-aside"><span class="location-dot"></span> Halmstad, Sverige<br><small id="coverage">12 produktvyer · 7 officiella sidor</small></div></section>
-<section class="store-bar" aria-label="Butik"><div class="store-picker"><label for="store">Välj din butik</label><select id="store"><option value="willys-oster">Willys Halmstad Öster</option><option value="willys-flygstaden">Willys Halmstad Flygstaden</option><option value="hemkop-c">Hemköp Halmstad C</option><option value="coop-stora">Stora Coop Halmstad</option><option value="coop-gamletull">Coop Gamletull Halmstad</option><option value="coop-flygaregatan">Coop Flygaregatan</option><option value="coop-furuvagen">Coop Furuvägen</option><option value="coop-fyllinge">Coop Fyllinge</option><option value="xtra-snostorp">X:-Tra Snöstorpsvägen</option><option value="lidl-torpaledsvagen">Lidl Torpaledsvägen</option><option value="lidl-gesallgatan">Lidl Gesällgatan</option><option value="lidl-tegelbruket">Lidl Tegelbruket</option><option value="ica-hogskolan">Maxi ICA Stormarknad Högskolan · Officiell sida</option><option value="ica-flygstaden">Maxi ICA Stormarknad Flygstaden · Officiell sida</option><option value="ica-vallas">ICA Supermarket Vallås · Officiell sida</option><option value="ica-sondrum">ICA Supermarket Söndrum · Officiell sida</option><option value="ica-frosakull">ICA Nära Frösakull · Officiell sida</option><option value="citygross">City Gross Halmstad · Officiell sida</option><option value="tempo-backagard">Tempo Halmstad Bäckagård · Officiell sida</option></select></div><div class="store-context"><strong id="store-name"></strong><span id="address"></span></div><a id="source" class="source-link" target="_blank" rel="noopener noreferrer">Butikens erbjudanden ↗</a></section>
+<button id="theme" class="quiet" type="button" aria-label="Byt till mörkt tema">Mörkt tema</button></header>
+<main id="main" tabindex="-1">
+<section class="hero"><div><h1>Veckans fynd,<br>nära dig.</h1><p>Alla erbjudanden på ett ställe. Hitta det som passar dig.</p></div><div class="hero-aside"><span class="location-dot"></span> Halmstad, Sverige<br><small id="coverage">12 produktvyer · 7 officiella sidor</small></div></section>
+<section class="store-bar" aria-label="Butik"><div class="store-picker"><label for="store">Välj din butik</label><select id="store"><option value="willys-oster">Willys Halmstad Öster</option><option value="willys-flygstaden">Willys Halmstad Flygstaden</option><option value="hemkop-c">Hemköp Halmstad C</option><option value="coop-stora">Stora Coop Halmstad</option><option value="coop-gamletull">Coop Gamletull Halmstad</option><option value="coop-flygaregatan">Coop Flygaregatan</option><option value="coop-furuvagen">Coop Furuvägen</option><option value="coop-fyllinge">Coop Fyllinge</option><option value="xtra-snostorp">X:-Tra Snöstorpsvägen</option><option value="lidl-torpaledsvagen">Lidl Torpaledsvägen</option><option value="lidl-gesallgatan">Lidl Gesällgatan</option><option value="lidl-tegelbruket">Lidl Tegelbruket</option><option value="ica-hogskolan">Maxi ICA Stormarknad Högskolan · Officiell sida</option><option value="ica-flygstaden">Maxi ICA Stormarknad Flygstaden · Officiell sida</option><option value="ica-vallas">ICA Supermarket Vallås · Officiell sida</option><option value="ica-sondrum">ICA Supermarket Söndrum · Officiell sida</option><option value="ica-frosakull">ICA Nära Frösakull · Officiell sida</option><option value="citygross">City Gross Halmstad · Officiell sida</option><option value="tempo-backagard">Tempo Halmstad Bäckagård · Officiell sida</option></select></div><div class="store-context"><strong id="store-name"></strong><span id="address"></span></div><a id="source" class="source-link" target="_blank" rel="noopener noreferrer">Butikens erbjudanden <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14"/><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg></a></section>
 <section id="summary" class="summary" aria-label="Översikt"><div class="summary-item"><strong id="total">—</strong><span>aktuella erbjudanden</span></div><div class="summary-item"><strong id="members">—</strong><span>medlemspriser</span></div><div class="summary-item"><strong id="ending">—</strong><span>slutar idag</span></div></section>
 <form id="filters" class="filters" role="search">
 <div class="search-field"><label for="search">Sök produkter</label><input type="search" id="search" maxlength="200" placeholder="Vara, varumärke eller storlek…" autocomplete="off"></div>
 <div><label for="membership">Medlemskrav</label><select id="membership"><option value="all">Alla erbjudanden</option><option value="general">Utan medlemskrav</option><option value="member">Medlemspriser</option></select></div>
 <div><label for="expiry">Giltighet</label><select id="expiry"><option value="all">Alla slutdatum</option><option value="today">Slutar idag</option><option value="soon">Inom 3 dagar</option></select></div>
 <div><label for="sort">Sortera</label><select id="sort"><option value="source">Butikens ordning</option><option value="discount">Störst prissänkning (%)</option><option value="saving">Störst besparing (kr/enhet)</option><option value="expiry">Slutar snart</option><option value="name">Namn A–Ö</option></select></div>
-<div class="actions"><button id="refresh" type="button">↻ Uppdatera</button><button id="reset" class="quiet" type="button">Återställ</button></div>
+<div class="actions"><button id="refresh" type="button"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M19.5 12a7.5 7.5 0 1 1-2-5L20 9"/></svg><span class="button-label">Uppdatera</span></button><button id="reset" class="quiet" type="button">Återställ</button></div>
 </form>
 <div id="status" class="notice" role="status" aria-live="polite" hidden></div>
 <p id="note" class="caption" hidden></p><p id="sort-note" class="caption" hidden>Besparing beräknas mot butikens visade jämförelsepris, per prisenhet. Sorter kan skilja sig. Saknas jämförbara priser visas varan sist.</p>
 <div class="results-bar"><strong id="results-count" aria-live="polite">Hämtar erbjudanden…</strong><span id="freshness"></span></div>
 <div id="grid" class="offer-grid" aria-busy="true"></div>
 <div id="empty" class="empty" hidden><strong>Inga matchningar just nu</strong><p>Prova ett annat sökord eller återställ filtren.</p></div>
-<div id="official" class="empty" hidden><span class="eyebrow">BUTIKENS EGEN SIDA</span><h2>Erbjudandena finns hos butiken</h2><p>Den här butiken har ännu ingen produktlista i Food Sale. Sökning och sortering är därför inte tillgängliga här.</p><a id="official-source" class="button-link" target="_blank" rel="noopener noreferrer">Öppna butikens erbjudanden ↗</a></div>
-<div class="pagination"><p id="page-note" class="caption"></p><button id="more" type="button" hidden>Visa fler</button><button id="all" class="quiet" type="button" hidden>Visa alla</button></div>
+<div id="official" class="empty" hidden><h2>Erbjudandena finns hos butiken</h2><p>Den här butiken har ännu ingen produktlista i Food Sale. Sökning och sortering är därför inte tillgängliga här.</p><a id="official-source" class="button-link" target="_blank" rel="noopener noreferrer">Öppna butikens erbjudanden <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14"/><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg></a></div>
+<div class="pagination"><p id="page-note" class="caption" role="status" aria-live="polite"></p><button id="more" type="button" hidden>Visa fler</button><button id="all" class="quiet" type="button" hidden>Visa alla</button></div>
 </main>
 <footer class="footnote"><strong>Food Sale / Halmstad</strong><p>Offentliga butikserbjudanden. Medlemspriser kräver medlemskap hos respektive kedja. Personliga kuponger och lokalt lagersaldo ingår inte. Kontrollera alltid pris och villkor hos butiken. Fristående visare.</p></footer>
 <noscript><p>Aktivera JavaScript för att söka och filtrera erbjudanden. Butikerna finns också via sina officiella erbjudandesidor.</p></noscript>
@@ -905,26 +1018,25 @@ PAGE = r"""<!doctype html>
 <script>'use strict';
 const catalogue=JSON.parse(document.getElementById('catalogue').textContent);
 const $=id=>document.getElementById(id);
-const controls=['search','membership','expiry','sort'];
 let limit=48, sequence=0, controller, debounce, poll, fetchedAt=null, activeStore=null;
 const params=new URLSearchParams(location.search);
 $('store').value=catalogue[params.get('store')]?params.get('store'):'willys-oster';
-function themeButton(){const dark=document.documentElement.dataset.theme==='dark';$('theme').textContent=dark?'Ljust tema':'Mörkt tema';$('theme').setAttribute('aria-pressed',String(dark));$('theme').setAttribute('aria-label',dark?'Byt till ljust tema':'Byt till mörkt tema')}
+function themeButton(){const dark=document.documentElement.dataset.theme==='dark';$('theme').textContent=dark?'Ljust tema':'Mörkt tema';$('theme').setAttribute('aria-label',dark?'Byt till ljust tema':'Byt till mörkt tema')}
 function saveUrl(){const url=new URL(location.href);url.searchParams.set('store',$('store').value);url.searchParams.set('theme',document.documentElement.dataset.theme);history.replaceState(null,'',url)}
 $('theme').addEventListener('click',()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;try{localStorage.setItem('foodsale-theme',theme)}catch{}themeButton();saveUrl()});themeButton();
 function notice(text,kind='info'){$('status').textContent=text;$('status').className='notice '+kind;$('status').hidden=!text}
 function clearCards(){ $('grid').replaceChildren();$('total').textContent='—';$('members').textContent='—';$('ending').textContent='—';$('more').hidden=true;$('all').hidden=true;$('page-note').textContent='';$('results-count').textContent='';$('freshness').textContent='';$('empty').hidden=true;fetchedAt=null }
 function loading(){if(!$('grid').children.length){$('grid').innerHTML=Array.from({length:6},()=>'<div class="skeleton" aria-hidden="true"><div></div><span></span><span></span></div>').join('')} $('grid').setAttribute('aria-busy','true')}
-function storeDetails(){const config=catalogue[$('store').value];$('store-name').textContent=config.name;$('address').textContent=config.address;for(const id of ['source','official-source'])$(id).href=config.source;const external=config.provider==='official';$('official').hidden=!external;$('summary').hidden=external;$('filters').hidden=external;$('note').hidden=true;$('sort-note').hidden=true;return external}
+function storeDetails(){const config=catalogue[$('store').value];$('store-name').textContent=config.name;$('address').textContent=config.address;for(const id of ['source','official-source'])$(id).href=config.source;const external=config.provider==='official';$('official').hidden=!external;$('summary').hidden=external;$('filters').hidden=external;if(external){$('note').hidden=true;$('sort-note').hidden=true}return external}
 function schedule(seconds){clearTimeout(poll);poll=setTimeout(()=>{if(document.visibilityState==='visible')load();else schedule(60)},seconds*1000)}
 async function load(force=false){
  clearTimeout(poll);clearTimeout(debounce);if(controller)controller.abort();const requestId=++sequence;const store=$('store').value;
- if(activeStore!==store){clearCards();notice('');activeStore=store}saveUrl();
+ if(activeStore!==store){clearCards();notice('');$('note').hidden=true;$('sort-note').hidden=true;activeStore=store}saveUrl();
  if(storeDetails()){clearCards();$('grid').setAttribute('aria-busy','false');notice('');return}
  if(fetchedAt&&Date.now()-new Date(fetchedAt).getTime()>=600000)clearCards();
- loading();if(!$('status').textContent||force)notice(force?'Kontrollerar butikens senaste erbjudanden…':'Hämtar butikens erbjudanden…');
+ loading();if(!fetchedAt)notice('Hämtar butikens erbjudanden…');
  controller=new AbortController();const query=new URLSearchParams({store,q:$('search').value,membership:$('membership').value,expiry:$('expiry').value,sort:$('sort').value,limit:String(limit)});
- $('refresh').disabled=true;
+ $('refresh').disabled=true;$('refresh').querySelector('.button-label').textContent=force?'Uppdaterar…':'Uppdatera';
  try{
   const response=await fetch('/api/offers?'+query,{method:force?'POST':'GET',headers:force?{'X-FoodSale-Request':'1'}:{},signal:controller.signal,cache:'no-store'});
   const data=await response.json();if(requestId!==sequence)return;
@@ -939,7 +1051,7 @@ async function load(force=false){
   $('more').textContent='Visa 48 till';$('all').textContent=`Visa alla ${data.matches}`;
   schedule(data.refreshing?3:60);
  }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;clearCards();notice(error.message||'Anslutningen misslyckades. Försök igen.','error');schedule(30)}
- finally{if(requestId===sequence){$('grid').setAttribute('aria-busy','false');$('refresh').disabled=false}}
+ finally{if(requestId===sequence){$('grid').setAttribute('aria-busy','false');$('refresh').disabled=false;$('refresh').querySelector('.button-label').textContent='Uppdatera'}}
 }
 $('filters').addEventListener('submit',event=>{event.preventDefault();limit=48;load()});
 $('search').addEventListener('input',()=>{clearTimeout(debounce);limit=48;debounce=setTimeout(()=>load(),200)});
@@ -951,7 +1063,7 @@ document.addEventListener('visibilitychange',()=>{if(document.visibilityState===
 </script>
 </body></html>
 """
-CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-VvK7FVdLHe+RtLWPrV/ef7DhX6EXusnbJQyeoXT/m6A='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-wwI7wDV6BKjkH0SNU+KMMgdlN6E6mXp1Xu7EifBCFTA='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 MEMBERSHIP = {'all': 'Alla erbjudanden', 'general': 'Utan medlemskrav', 'member': 'Medlemspriser'}
 EXPIRY = {'all': 'Alla slutdatum', 'today': 'Slutar idag', 'soon': 'Inom 3 dagar'}
