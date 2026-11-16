@@ -1,29 +1,180 @@
-"""Streamlit viewer for public Halmstad grocery offers.
-Run: streamlit run app.py
-All application code lives in this file. Internet access is required.
+"""Food Sale · FastAPI. Run: python app.py (or uvicorn app:app).
+All application code, styles and scripts live in this file.
 """
+import argparse
+import base64
 import datetime as dt
+import hashlib
 import html
 import json
+import os
+import re
+import threading
+import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-import unicodedata
-import re
+import webbrowser
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, wraps
 from html.parser import HTMLParser
+from typing import Literal
 from zoneinfo import ZoneInfo
-import streamlit as st
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+
+# All caches contain public data only and are private to this server process.
+# In-memory state disappears on restart; run one worker to avoid duplicate caches.
+class ExtractionUnavailable(Exception):
+    def __init__(self, message, retry_after=30):
+        super().__init__(message)
+        self.retry_after = max(1, int(retry_after))
+
+
+def cached_metadata(ttl=86400, max_entries=8):
+    """Single-flight metadata TTL cache, loaded on its caller's worker thread."""
+    def decorate(fn):
+        lock, values, pending, failures = threading.RLock(), OrderedDict(), {}, {}
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            with lock:
+                if key in values and time.monotonic() - values[key][0] < ttl:
+                    values.move_to_end(key)
+                    return values[key][1]
+                if failures.get(key, 0) > time.monotonic():
+                    raise ExtractionUnavailable('Butikens uppgifter kunde inte hämtas. Försök igen om en stund.')
+                owner = key not in pending
+                future = pending.setdefault(key, Future())
+            if not owner:
+                return future.result(timeout=90)
+            try:
+                value = fn(*args, **kwargs)
+                with lock:
+                    failures.pop(key, None)
+                    values[key] = (time.monotonic(), value)
+                    values.move_to_end(key)
+                    while len(values) > max_entries:
+                        values.popitem(last=False)
+                future.set_result(value)
+                return value
+            except Exception as exc:
+                with lock:
+                    failures[key] = time.monotonic() + max(30, getattr(exc, 'source_retry_after', 0))
+                future.set_exception(exc)
+                raise
+            finally:
+                with lock:
+                    pending.pop(key, None)
+        def clear(*args, **kwargs):
+            with lock:
+                if args or kwargs:
+                    key = (args, tuple(sorted(kwargs.items())))
+                    values.pop(key, None)
+                    failures.pop(key, None)
+                else:
+                    values.clear()
+                    failures.clear()
+        wrapper.clear = clear
+        return wrapper
+    return decorate
+
+
+@dataclass
+class CacheEntry:
+    value: dict | None = None
+    saved: float = 0
+    future: Future | None = None
+    retry_at: float = 0
+    failed: bool = False
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    value: dict
+    stale: bool
+    refreshing: bool
+    failed: bool
+
+
+class OfferCache:
+    """Bounded, single-flight stale-while-revalidate cache with a hard age cap."""
+    def __init__(self, ttl=300, stale_for=300, cooldown=30, workers=3):
+        self.ttl, self.stale_for, self.cooldown = ttl, stale_for, cooldown
+        self.lock = threading.RLock()
+        self.entries = OrderedDict()
+        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='offers')
+
+    def _load(self, entry, loader):
+        try:
+            value = loader()
+            with self.lock:
+                entry.value, entry.saved = value, time.monotonic()
+                entry.failed, entry.retry_at = False, 0
+            return value
+        except Exception as exc:
+            # Neither failure nor retry advances the successful snapshot's timestamp.
+            with self.lock:
+                entry.failed, entry.retry_at = True, time.monotonic() + max(self.cooldown, getattr(exc, 'source_retry_after', 0))
+            raise ExtractionUnavailable('Butikens erbjudanden kunde inte hämtas. Försök igen om en stund.', max(self.cooldown, entry.retry_at - time.monotonic())) from None
+
+    def get(self, key, loader, force=False):
+        with self.lock:
+            now = time.monotonic()
+            entry = self.entries.setdefault(key, CacheEntry())
+            self.entries.move_to_end(key)
+            # Keys come only from the fixed catalogue and the server's current date.
+            while len(self.entries) > 32:
+                evict = next((k for k, v in self.entries.items()
+                              if k != key and (v.future is None or v.future.done())), None)
+                if evict is None:
+                    break
+                self.entries.pop(evict)
+            age = now - entry.saved
+            running = entry.future is not None and not entry.future.done()
+            allowed = entry.value is not None and age < self.ttl + self.stale_for
+            if entry.value is not None and age < self.ttl and (not force or age < self.cooldown):
+                return Snapshot(entry.value, False, running, entry.failed)
+            if not running and now >= entry.retry_at:
+                entry.future = self.pool.submit(self._load, entry, loader)
+                running = True
+            if allowed:
+                return Snapshot(entry.value, age >= self.ttl, running, entry.failed)
+            if not running:
+                raise ExtractionUnavailable('Butikens erbjudanden kunde inte hämtas. Försök igen om en stund.', max(1, entry.retry_at - now))
+            future = entry.future
+        try:
+            value = future.result(timeout=95)
+            return Snapshot(value, False, False, False)
+        except ExtractionUnavailable:
+            raise
+        except TimeoutError:
+            raise ExtractionUnavailable('Butikens erbjudanden kunde inte hämtas. Försök igen om en stund.') from None
+
+    def close(self):
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+
+offer_cache = OfferCache()
+
 
 BASE = "https://www.willys.se"
+
+
 STORE = "2236"
+
+
 SOURCE = BASE + "/erbjudanden/butik?StoreID=" + STORE
+
+
 STOCKHOLM = ZoneInfo("Europe/Stockholm")
 
 
-# Public store catalogue. Unsupported product feeds have an explicit official-page view.
 STORES = {
     'willys-oster': dict(name='Willys Halmstad Öster', provider='axfood', id='2236', base='https://www.willys.se', address='Laholmsvägen 37', member='Willys Plus', source=SOURCE),
     'willys-flygstaden': dict(name='Willys Halmstad Flygstaden', provider='axfood', id='2137', base='https://www.willys.se', address='Kundvägen 4', member='Willys Plus', source='https://www.willys.se/erbjudanden/butik?StoreID=2137'),
@@ -45,18 +196,6 @@ STORES = {
     'citygross': dict(name='City Gross Halmstad', provider='official', address='Stormgatan 14', source='https://www.citygross.se/butiker/halmstad'),
     'tempo-backagard': dict(name='Tempo Halmstad Bäckagård', provider='official', address='Akvarellgränd 1', source='https://www.tempo.se/butiker/tempo-halmstad-backagard/'),
 }
-
-
-def read_public(url, headers=None):
-    request = urllib.request.Request(url, headers={
-        'User-Agent': 'FoodSale/2.0 (public offers viewer)',
-        'Accept': 'application/json,text/html', **(headers or {})})
-    with urllib.request.urlopen(request, timeout=25) as response:
-        # Bound responses so an unexpected source cannot exhaust server memory.
-        body = response.read(12_000_001)
-        if len(body) > 12_000_000:
-            raise ValueError('Butikens svar är för stort.')
-        return body.decode('utf-8')
 
 
 def public_json(url, headers=None):
@@ -106,7 +245,7 @@ def money(value):
     return format(amount, '.2f').replace('.', ',')
 
 
-@st.cache_data(ttl=86400, max_entries=1, show_spinner=False)
+@cached_metadata(ttl=86400, max_entries=1)
 def coop_access():
     # Read the same anonymous-client configuration used by Coop's public store page.
     page = read_public('https://www.coop.se/butiker-erbjudanden/coop/coop-fyllinge/')
@@ -123,7 +262,7 @@ def coop_access():
     return result
 
 
-@st.cache_data(ttl=86400, max_entries=6, show_spinner=False)
+@cached_metadata(ttl=86400, max_entries=6)
 def coop_store(store_key):
     config = STORES[store_key]
     access = coop_access()
@@ -133,6 +272,44 @@ def coop_store(store_key):
             or clean_text(data.get('city')).casefold() != 'halmstad'):
         raise ValueError('Butikens identitet kunde inte bekräftas.')
     return data
+
+
+def coop_price_label(price):
+    style = price.get('termStyle')
+    if style == 'Ladder Deal':
+        steps = price.get('steps')
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 20:
+            raise ValueError('Coops mängdpris saknar giltiga steg.')
+        labels, details = [], []
+        for step in steps:
+            step = require_mapping(step, 'Coop price step')
+            quantity = price_amount(step.get('quantity'))
+            if quantity is None or quantity <= 0 or step.get('dealType') != 'pris':
+                raise ValueError('Okänt mängdpris från Coop.')
+            unit = plain_text(step.get('unit'))
+            count = f'{quantity:g}' + (' ' + unit if unit and unit != 'st' else '')
+            labels.append(count + ' för ' + money(step.get('discountValue')) + ' kr')
+            comparison = plain_text(step.get('comparisonPrice'))
+            if comparison:
+                details.append(comparison)
+        return ' · '.join(labels), details
+    if style == 'Buy X, Pay Y':
+        buy, pay = price_amount(price.get('buyAmount')), price_amount(price.get('payAmount'))
+        if (buy is None or pay is None or not 0 < pay < buy or
+                buy != buy.to_integral_value() or pay != pay.to_integral_value()):
+            raise ValueError('Ogiltigt köp-/betala-villkor från Coop.')
+        claim = plain_text(price.get('claim'))
+        return f'Köp {buy:g}, betala för {pay:g}', [claim] if claim else []
+    amount = money(price.get('discountValue'))
+    if style == 'Percentage Off':
+        return amount + ' % rabatt', []
+    if style != 'Discount Price':
+        raise ValueError('Okänd pristyp från Coop.')
+    quantity = price_amount(price.get('quantity'))
+    unit = plain_text(price.get('unit'))
+    if quantity is not None and quantity > 1:
+        return f'{quantity:g} för {amount} kr', []
+    return amount + ' kr' + ('/' + unit if unit else ''), []
 
 
 def normalize_coop(data, config, today):
@@ -157,18 +334,8 @@ def normalize_coop(data, config, today):
         content = require_mapping(raw.get('content'), 'Coop offer content')
         price = require_mapping(raw.get('priceInformation'), 'Coop price')
         member = price.get('isMemberPrice') is True
-        unit = plain_text(price.get('unit'))
-        amount = money(price.get('discountValue'))
-        quantity = price_amount(price.get('quantity'))
-        if price.get('termStyle') == 'Percentage Off':
-            label = amount + ' % rabatt'
-        elif price.get('termStyle') != 'Discount Price':
-            raise ValueError('Okänd pristyp från Coop.')
-        elif quantity is not None and quantity > 1:
-            label = f'{quantity:g} för {amount} kr'
-        else:
-            label = amount + ' kr' + ('/' + unit if unit else '')
-        conditions = [plain_text(content.get(k)) for k in
+        label, price_conditions = coop_price_label(price)
+        conditions = price_conditions + [plain_text(content.get(k)) for k in
                       ('dealOfferLimitText', 'recyclingInformationText', 'formattedComparativePriceText')]
         variants = raw.get('clusterInteriorOffers')
         if not isinstance(variants, list):
@@ -214,7 +381,6 @@ def fetch_coop(store_key):
         note='Coop anger inget ordinarie pris i denna källa. Besparing och prissänkning beräknas därför inte. Grupperade sorter ingår i sökningen.')
 
 
-@st.cache_data(ttl=300, max_entries=2, show_spinner=False, refresh_mode='background')
 def lidl_campaigns(stockholm_day):
     # All three local branches share this public regional dataset, fetched once.
     homepage = read_public('https://www.lidl.se/')
@@ -224,14 +390,16 @@ def lidl_campaigns(stockholm_day):
     for path in paths:
         if not re.fullmatch(r'/c/store/[a-z0-9-]+/a\d+', path):
             raise ValueError('Okänd kampanjadress från Lidl.')
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        pages = list(pool.map(read_public, ['https://www.lidl.se' + path for path in paths]))
     products = []
-    for page in pages:
-        items = re.findall(r'data-grid-data="([^"]+)"', page)
-        if not items:
-            raise ValueError('En Lidl-kampanj saknar läsbara produkter. Ingen delvis lista visas.')
-        products.extend(json.loads(html.unescape(item)) for item in items)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        # Bounded batches avoid retaining every campaign HTML page at once.
+        for offset in range(0, len(paths), 4):
+            urls = ['https://www.lidl.se' + path for path in paths[offset:offset + 4]]
+            for page in pool.map(read_public, urls):
+                items = re.findall(r'data-grid-data="([^"]+)"', page)
+                if not items:
+                    raise ValueError('En Lidl-kampanj saknar läsbara produkter. Ingen delvis lista visas.')
+                products.extend(json.loads(html.unescape(item)) for item in items)
     return dict(products=products, fetchedAt=dt.datetime.now(STOCKHOLM).isoformat())
 
 
@@ -299,7 +467,7 @@ def normalize_lidl(products, today):
     return offers
 
 
-@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
+@cached_metadata(ttl=86400, max_entries=3)
 def lidl_store(store_key):
     config = STORES[store_key]
     page = read_public(config['source'])
@@ -329,19 +497,6 @@ def fetch_lidl(store_key):
         fetchedAt=data['fetchedAt'], today=now.date().isoformat(), sourceResults=len(data['products']),
         offers=normalize_lidl(data['products'], now.date()),
         note='Lidls publicerade kampanjer med samma pris i samtliga tre Halmstadsregioner. Lokalt lagersaldo ingår inte. Referenspriser visas enligt Lidl; alla kampanjvaror har inte ett tidigare pris.')
-
-def get_json(path, params=None, base=BASE):
-    url = base + path
-    if params:
-        url += '?' + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={
-        'Accept': 'application/json', 'User-Agent': 'FoodSale/2.0 (public offers viewer)'})
-    with urllib.request.urlopen(request, timeout=25) as response:
-        value = json.load(response)
-    if not isinstance(value, dict):
-        raise ValueError('The store returned an unexpected response format.')
-    return value
-
 
 
 def require_mapping(value, label):
@@ -376,7 +531,7 @@ def validate_product(product):
                 raise ValueError(f'Unexpected promotion {field} format from the store.')
     return promotions
 
-@lru_cache(maxsize=512)
+
 def parse_date(value):
     if not value:
         return None
@@ -388,7 +543,6 @@ def parse_date(value):
 
 def clean_text(value):
     return str(value).strip() if value is not None else ''
-
 
 
 def price_amount(value):
@@ -441,6 +595,7 @@ def discount_details(product, promotion):
         return dict(discount_percent=None, saving=None, saving_unit=unit)
     saving = max(Decimal(0), ordinary - amount)
     return dict(discount_percent=float(saving / ordinary * 100), saving=float(saving), saving_unit=unit)
+
 
 def normalize(results, today):
     if not isinstance(results, list):
@@ -500,7 +655,7 @@ def normalize(results, today):
     return offers
 
 
-@st.cache_data(ttl=86400, max_entries=3, show_spinner=False)
+@cached_metadata(ttl=86400, max_entries=3)
 def store_information(store_key='willys-oster'):
     config = STORES[store_key]
     return get_json('/axfood/rest/v2/store/' + config['id'], base=config['base'])
@@ -520,9 +675,12 @@ def fetch_offers(store_key='willys-oster'):
     if store.get('storeId') != store_id or store.get('name') != config['name']:
         raise ValueError('Store identity could not be confirmed; no offers displayed.')
     results = []
+    started = time.monotonic()
     expected_total = None
     expected_pages = None
     for page in range(100):
+        if time.monotonic() - started > 40:
+            raise TimeoutError('Butikens hämtning tog för lång tid.')
         data = first_page if page == 0 else get_json('/axfood/rest/v2/search/campaigns/offline',
                         dict(q=store_id, type='PERSONAL_GENERAL', page=page, size=200), base=base)
         require_mapping(data, 'offers response')
@@ -555,17 +713,6 @@ def fetch_offers(store_key='willys-oster'):
     return dict(store=store['name'], address=clean_text(address.get('formattedAddress')),
                 source=config['source'], fetchedAt=now.isoformat(), today=now.date().isoformat(),
                 sourceResults=len(results), offers=[dict(offer, member_label=config['member']) for offer in normalize(results, now.date())])
-
-
-@st.cache_data(ttl=300, max_entries=24, show_spinner=False, refresh_mode="background")
-def cached_offers(stockholm_day, store_key='willys-oster', schema_version=4):
-    # Public-data cache isolates providers and branches. The date bounds rollover.
-    provider = STORES[store_key]['provider']
-    if provider == 'axfood':
-        return fetch_offers(store_key)
-    if provider == 'coop':
-        return fetch_coop(store_key)
-    raise ValueError('Produktlistan är inte tillgänglig för denna butik.')
 
 
 def escape(value):
@@ -627,7 +774,7 @@ def card(offer, today=None):
         membership += f'<span class="badge">−{discount:.0f} %</span>'
         saving_text = f'{saving:.2f}'.replace('.', ',')
         saving_label = f'<p class="ordinary">Besparing {saving_text} kr/{escape(offer["saving_unit"])}</p>'
-    image = ('<img loading="lazy" referrerpolicy="no-referrer" src="' + escape(offer['image']) +
+    image = ('<img loading="lazy" decoding="async" referrerpolicy="no-referrer" src="' + escape(offer['image']) +
              '" alt="' + escape(offer['name']) + '">') if offer['image'] else '<span>Bild saknas</span>'
     ordinary = '<p class="ordinary">' + escape(offer.get('ordinary_label', 'Ordinarie')) + ' ' + escape(offer['ordinary']) + '</p>' if offer['ordinary'] else ''
     conditions = ''.join('<div>' + escape(v) + '</div>' for v in offer['conditions'])
@@ -643,7 +790,52 @@ def card(offer, today=None):
 <div class="conditions">{conditions}</div><div class="offer-dates">{display_date(offer['start'])} – {display_date(offer['end'])}</div></article>'''
 
 
-CSS = '''<style>
+def read_public(url, headers=None):
+    request = urllib.request.Request(url, headers={
+        'User-Agent': 'FoodSale/2.0 (public offers viewer)',
+        'Accept': 'application/json,text/html', **(headers or {})})
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                body = response.read(12_000_001)
+                if len(body) > 12_000_000:
+                    raise ValueError('Butikens svar är för stort.')
+                return body.decode('utf-8')
+        except urllib.error.HTTPError as exc:
+            delay = 0
+            retry = exc.headers.get('Retry-After', '')
+            try:
+                delay = max(0, int(retry))
+            except ValueError:
+                if retry:
+                    from email.utils import parsedate_to_datetime
+                    try:
+                        delay = max(0, (parsedate_to_datetime(retry) - dt.datetime.now(dt.timezone.utc)).total_seconds())
+                    except (ValueError, TypeError):
+                        delay = 30
+            exc.source_retry_after = delay
+            if attempt == 0 and exc.code in (502, 503, 504) and delay <= 1:
+                time.sleep(max(.25, delay))
+                continue
+            raise
+
+
+def get_json(path, params=None, base=BASE):
+    url = base + path
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    return require_mapping(public_json(url), 'store response')
+
+
+PAGE = r"""<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><meta name="description" content="Veckans butikserbjudanden i Halmstad. Sök, filtrera och hitta dina fynd.">
+<title>Food Sale · Halmstad</title>
+<script>(()=>{let theme;try{theme=new URLSearchParams(location.search).get('theme')||localStorage.getItem('foodsale-theme')}catch{}if(!['light','dark'].includes(theme))theme=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=theme})();
+</script>
+<style>
 .stApp{background:var(--viewer-bg);color:var(--viewer-text)}
 .block-container{max-width:1390px;padding:5rem 3rem 3rem}
 .hero{padding:0 0 16px;border-bottom:1px solid var(--viewer-border);margin-bottom:4px}
@@ -675,137 +867,223 @@ CSS = '''<style>
 @media(max-width:640px){.block-container{padding:4.5rem 1rem 2rem}.hero{padding-bottom:20px}.hero h1{font-size:34px}.summary{gap:6px}.summary-item{padding:10px;display:block}.summary-item strong{font-size:22px;display:block}.summary-item span{font-size:10px}.offer-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.offer-card{padding:12px}.offer-picture{height:125px;padding:6px}.offer-picture img{max-height:113px}.offer-card h2{font-size:16px}.offer-price{font-size:23px}.badges{min-height:40px}.badge{font-size:9px}}
 @media(max-width:340px){.offer-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){.offer-card{transition:none}}
-</style>'''
+:root{--viewer-bg:#f6f5f1;--viewer-card:#fff;--viewer-text:#222;--viewer-muted:#62625d;--viewer-border:#d3d1c9;--viewer-accent:#a12d26;--viewer-input:#fff;color-scheme:light}
+:root[data-theme=dark]{--viewer-bg:#17191d;--viewer-card:#22262c;--viewer-text:#f1f2f5;--viewer-muted:#b8bfc9;--viewer-border:#414854;--viewer-accent:#ffaaa3;--viewer-input:#252a32;color-scheme:dark}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--viewer-bg);color:var(--viewer-text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}a{color:var(--viewer-accent)}button,a,input,select{touch-action:manipulation}:focus-visible{outline:3px solid var(--viewer-accent);outline-offset:3px}button,select{cursor:pointer}button,.button-link{padding:11px 16px;border:1px solid var(--viewer-border);border-radius:9px;background:var(--viewer-card);color:var(--viewer-text);font-weight:650;text-decoration:none}button:hover,.button-link:hover{border-color:var(--viewer-accent)}button:disabled{cursor:wait;opacity:.6}.quiet{background:transparent}.block-container{margin:auto;padding:30px 40px 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:48px}.brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--viewer-text);font-size:18px;font-weight:750;letter-spacing:-.035em}.brand small{display:block;font-size:9px;letter-spacing:.2em;font-weight:600;color:var(--viewer-muted)}.hero{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:32px;margin-bottom:24px}.hero h1{font-size:clamp(34px,5.5vw,64px);line-height:1.06;margin:16px 0}.eyebrow{font-size:10px;letter-spacing:.18em}.hero-aside{font-size:13px;line-height:1.8;text-align:right;color:var(--viewer-muted)}.hero-aside small{font-size:11px}.location-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--viewer-accent);margin-right:6px}.store-bar{display:flex;align-items:center;gap:24px;padding:20px;border-radius:14px;background:var(--viewer-card);border:1px solid var(--viewer-border);margin-bottom:20px}.store-picker{width:360px;max-width:100%}label{display:block;font-size:11px;font-weight:700;letter-spacing:.025em;margin-bottom:7px;color:var(--viewer-muted)}input,select{width:100%;min-width:0;padding:12px;border:1px solid var(--viewer-border);border-radius:8px;background:var(--viewer-input);color:var(--viewer-text);min-height:45px}input::placeholder{color:var(--viewer-muted)}.store-context{display:flex;flex-direction:column;font-size:13px;gap:3px}.store-context span{color:var(--viewer-muted);font-size:12px}.source-link{margin-left:auto;font-size:12px;white-space:nowrap}.summary{margin-bottom:24px}.filters{display:grid;grid-template-columns:2fr 1.2fr 1.1fr 1.6fr;gap:14px;align-items:end}.actions{display:flex;gap:8px;grid-column:1/-1;justify-content:flex-end}.caption{font-size:12px;color:var(--viewer-muted);line-height:1.7;margin:14px 0}.notice{margin:16px 0;padding:13px 16px;border-radius:9px;border:1px solid var(--viewer-border);background:var(--viewer-card);font-size:13px}.notice.warning{border-left:4px solid #bf8c31}.notice.error{border-left:4px solid var(--viewer-accent)}.empty{text-align:center;border:1px dashed var(--viewer-border);border-radius:14px;padding:50px 20px;color:var(--viewer-muted)}.empty h2,.empty strong{color:var(--viewer-text)}.empty .eyebrow{justify-content:center}.empty p{margin-bottom:28px}.pagination{text-align:center;padding:20px}.pagination button{margin:4px}.skeleton{border-radius:16px;border:1px solid var(--viewer-border);background:var(--viewer-card);padding:18px;height:370px}.skeleton div{height:175px;background:var(--viewer-bg);border-radius:10px;margin:25px 0}.skeleton span{display:block;height:16px;width:70%;margin:16px 0;background:var(--viewer-bg);border-radius:4px}.skeleton span:last-child{width:40%}.skip{position:absolute;left:16px;top:-100px;background:var(--viewer-card);padding:12px;z-index:1}.skip:focus{top:10px}details summary{cursor:pointer;color:var(--viewer-accent)}
+@media(max-width:900px){.store-bar{flex-wrap:wrap;gap:14px}.store-picker{width:100%}.store-context{flex:1}.filters{grid-template-columns:1fr 1fr}.search-field{grid-column:1/-1}.hero-aside{display:none}}
+@media(max-width:640px){.block-container{padding:20px 16px}.topbar{margin-bottom:30px}.hero{padding-bottom:24px}.hero h1{font-size:42px}.store-bar{padding:14px}.source-link{white-space:normal}.store-context{min-width:150px}.summary{gap:7px}.summary-item span{font-size:10px}.filters{gap:12px}.actions{justify-content:stretch}.actions button{flex:1}select,input{font-size:16px}.results-bar{gap:8px}.offer-card{padding:12px}.offer-price{font-size:23px}}
+</style>
+</head>
+<body>
+<a class="skip" href="#filters">Hoppa till erbjudanden</a>
+<div class="block-container">
+<header class="topbar"><a class="brand" href="/" aria-label="Food Sale startsida"><span class="brand-mark">fs.</span><span>Food Sale <small>HALMSTAD</small></span></a>
+<button id="theme" class="quiet" type="button" aria-label="Byt till mörkt tema" aria-pressed="false">Mörkt tema</button></header>
+<main>
+<section class="hero"><div><p class="eyebrow">DIN LOKALA VECKOKOLL</p><h1>Veckans fynd,<br>nära dig.</h1><p>Alla erbjudanden på ett ställe. Hitta det som passar dig.</p></div><div class="hero-aside"><span class="location-dot"></span> Halmstad, Sverige<br><small id="coverage">12 produktvyer · 7 officiella sidor</small></div></section>
+<section class="store-bar" aria-label="Butik"><div class="store-picker"><label for="store">Välj din butik</label><select id="store"><option value="willys-oster">Willys Halmstad Öster</option><option value="willys-flygstaden">Willys Halmstad Flygstaden</option><option value="hemkop-c">Hemköp Halmstad C</option><option value="coop-stora">Stora Coop Halmstad</option><option value="coop-gamletull">Coop Gamletull Halmstad</option><option value="coop-flygaregatan">Coop Flygaregatan</option><option value="coop-furuvagen">Coop Furuvägen</option><option value="coop-fyllinge">Coop Fyllinge</option><option value="xtra-snostorp">X:-Tra Snöstorpsvägen</option><option value="lidl-torpaledsvagen">Lidl Torpaledsvägen</option><option value="lidl-gesallgatan">Lidl Gesällgatan</option><option value="lidl-tegelbruket">Lidl Tegelbruket</option><option value="ica-hogskolan">Maxi ICA Stormarknad Högskolan · Officiell sida</option><option value="ica-flygstaden">Maxi ICA Stormarknad Flygstaden · Officiell sida</option><option value="ica-vallas">ICA Supermarket Vallås · Officiell sida</option><option value="ica-sondrum">ICA Supermarket Söndrum · Officiell sida</option><option value="ica-frosakull">ICA Nära Frösakull · Officiell sida</option><option value="citygross">City Gross Halmstad · Officiell sida</option><option value="tempo-backagard">Tempo Halmstad Bäckagård · Officiell sida</option></select></div><div class="store-context"><strong id="store-name"></strong><span id="address"></span></div><a id="source" class="source-link" target="_blank" rel="noopener noreferrer">Butikens erbjudanden ↗</a></section>
+<section id="summary" class="summary" aria-label="Översikt"><div class="summary-item"><strong id="total">—</strong><span>aktuella erbjudanden</span></div><div class="summary-item"><strong id="members">—</strong><span>medlemspriser</span></div><div class="summary-item"><strong id="ending">—</strong><span>slutar idag</span></div></section>
+<form id="filters" class="filters" role="search">
+<div class="search-field"><label for="search">Sök produkter</label><input type="search" id="search" maxlength="200" placeholder="Vara, varumärke eller storlek…" autocomplete="off"></div>
+<div><label for="membership">Medlemskrav</label><select id="membership"><option value="all">Alla erbjudanden</option><option value="general">Utan medlemskrav</option><option value="member">Medlemspriser</option></select></div>
+<div><label for="expiry">Giltighet</label><select id="expiry"><option value="all">Alla slutdatum</option><option value="today">Slutar idag</option><option value="soon">Inom 3 dagar</option></select></div>
+<div><label for="sort">Sortera</label><select id="sort"><option value="source">Butikens ordning</option><option value="discount">Störst prissänkning (%)</option><option value="saving">Störst besparing (kr/enhet)</option><option value="expiry">Slutar snart</option><option value="name">Namn A–Ö</option></select></div>
+<div class="actions"><button id="refresh" type="button">↻ Uppdatera</button><button id="reset" class="quiet" type="button">Återställ</button></div>
+</form>
+<div id="status" class="notice" role="status" aria-live="polite" hidden></div>
+<p id="note" class="caption" hidden></p><p id="sort-note" class="caption" hidden>Besparing beräknas mot butikens visade jämförelsepris, per prisenhet. Sorter kan skilja sig. Saknas jämförbara priser visas varan sist.</p>
+<div class="results-bar"><strong id="results-count" aria-live="polite">Hämtar erbjudanden…</strong><span id="freshness"></span></div>
+<div id="grid" class="offer-grid" aria-busy="true"></div>
+<div id="empty" class="empty" hidden><strong>Inga matchningar just nu</strong><p>Prova ett annat sökord eller återställ filtren.</p></div>
+<div id="official" class="empty" hidden><span class="eyebrow">BUTIKENS EGEN SIDA</span><h2>Erbjudandena finns hos butiken</h2><p>Den här butiken har ännu ingen produktlista i Food Sale. Sökning och sortering är därför inte tillgängliga här.</p><a id="official-source" class="button-link" target="_blank" rel="noopener noreferrer">Öppna butikens erbjudanden ↗</a></div>
+<div class="pagination"><p id="page-note" class="caption"></p><button id="more" type="button" hidden>Visa fler</button><button id="all" class="quiet" type="button" hidden>Visa alla</button></div>
+</main>
+<footer class="footnote"><strong>Food Sale / Halmstad</strong><p>Offentliga butikserbjudanden. Medlemspriser kräver medlemskap hos respektive kedja. Personliga kuponger och lokalt lagersaldo ingår inte. Kontrollera alltid pris och villkor hos butiken. Fristående visare.</p></footer>
+<noscript><p>Aktivera JavaScript för att söka och filtrera erbjudanden. Butikerna finns också via sina officiella erbjudandesidor.</p></noscript>
+</div>
+<script id="catalogue" type="application/json">{"willys-oster": {"name": "Willys Halmstad Öster", "provider": "axfood", "address": "Laholmsvägen 37", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2236"}, "willys-flygstaden": {"name": "Willys Halmstad Flygstaden", "provider": "axfood", "address": "Kundvägen 4", "member": "Willys Plus", "source": "https://www.willys.se/erbjudanden/butik?StoreID=2137"}, "hemkop-c": {"name": "Hemköp Halmstad C", "provider": "axfood", "address": "Brogatan 14–16", "member": "Klubb Hemköp", "source": "https://www.hemkop.se/butik/4245"}, "coop-stora": {"name": "Stora Coop Halmstad", "provider": "coop", "address": "Prästvägen 1", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/stora-coop/stora-coop-halmstad/"}, "coop-gamletull": {"name": "Coop Gamletull Halmstad", "provider": "coop", "address": "Gamletullsgatan 20", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-gamletull-halmstad/"}, "coop-flygaregatan": {"name": "Coop Flygaregatan", "provider": "coop", "address": "Flygaregatan 12", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-flygaregatan/"}, "coop-furuvagen": {"name": "Coop Furuvägen", "provider": "coop", "address": "Furuvägen 63", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-furuvagen/"}, "coop-fyllinge": {"name": "Coop Fyllinge", "provider": "coop", "address": "Fyllingevägen 2", "member": "Coop-medlem", "source": "https://www.coop.se/butiker-erbjudanden/coop/coop-fyllinge/"}, "xtra-snostorp": {"name": "X:-Tra Snöstorpsvägen", "provider": "coop", "address": "Snöstorpsvägen 109", "member": "Coop-medlem", "source": "https://x-tra.se/butiker/snoestorpsvaegen"}, "lidl-torpaledsvagen": {"name": "Lidl Torpaledsvägen", "provider": "lidl", "address": "Torpaledsvägen 4", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/torpaledsvaegen-4/"}, "lidl-gesallgatan": {"name": "Lidl Gesällgatan", "provider": "lidl", "address": "Gesällgatan 3", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/gesaellgatan-3/"}, "lidl-tegelbruket": {"name": "Lidl Tegelbruket", "provider": "lidl", "address": "Tegelbruket 1", "member": "Lidl Plus", "source": "https://www.lidl.se/s/sv-SE/butiker/halmstad/tegelbruket-1/"}, "ica-hogskolan": {"name": "Maxi ICA Stormarknad Högskolan", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-hogskolan-1003925/"}, "ica-flygstaden": {"name": "Maxi ICA Stormarknad Flygstaden", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/maxi-ica-stormarknad-flygstaden-1003781/"}, "ica-vallas": {"name": "ICA Supermarket Vallås", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-vallas-1003811/"}, "ica-sondrum": {"name": "ICA Supermarket Söndrum", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-supermarket-sondrum-1003648/"}, "ica-frosakull": {"name": "ICA Nära Frösakull", "provider": "official", "address": "Halmstad", "source": "https://www.ica.se/erbjudanden/ica-nara-frosakull-1004064/"}, "citygross": {"name": "City Gross Halmstad", "provider": "official", "address": "Stormgatan 14", "source": "https://www.citygross.se/butiker/halmstad"}, "tempo-backagard": {"name": "Tempo Halmstad Bäckagård", "provider": "official", "address": "Akvarellgränd 1", "source": "https://www.tempo.se/butiker/tempo-halmstad-backagard/"}}</script>
+<script>'use strict';
+const catalogue=JSON.parse(document.getElementById('catalogue').textContent);
+const $=id=>document.getElementById(id);
+const controls=['search','membership','expiry','sort'];
+let limit=48, sequence=0, controller, debounce, poll, fetchedAt=null, activeStore=null;
+const params=new URLSearchParams(location.search);
+$('store').value=catalogue[params.get('store')]?params.get('store'):'willys-oster';
+function themeButton(){const dark=document.documentElement.dataset.theme==='dark';$('theme').textContent=dark?'Ljust tema':'Mörkt tema';$('theme').setAttribute('aria-pressed',String(dark));$('theme').setAttribute('aria-label',dark?'Byt till ljust tema':'Byt till mörkt tema')}
+function saveUrl(){const url=new URL(location.href);url.searchParams.set('store',$('store').value);url.searchParams.set('theme',document.documentElement.dataset.theme);history.replaceState(null,'',url)}
+$('theme').addEventListener('click',()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;try{localStorage.setItem('foodsale-theme',theme)}catch{}themeButton();saveUrl()});themeButton();
+function notice(text,kind='info'){$('status').textContent=text;$('status').className='notice '+kind;$('status').hidden=!text}
+function clearCards(){ $('grid').replaceChildren();$('total').textContent='—';$('members').textContent='—';$('ending').textContent='—';$('more').hidden=true;$('all').hidden=true;$('page-note').textContent='';$('results-count').textContent='';$('freshness').textContent='';$('empty').hidden=true;fetchedAt=null }
+function loading(){if(!$('grid').children.length){$('grid').innerHTML=Array.from({length:6},()=>'<div class="skeleton" aria-hidden="true"><div></div><span></span><span></span></div>').join('')} $('grid').setAttribute('aria-busy','true')}
+function storeDetails(){const config=catalogue[$('store').value];$('store-name').textContent=config.name;$('address').textContent=config.address;for(const id of ['source','official-source'])$(id).href=config.source;const external=config.provider==='official';$('official').hidden=!external;$('summary').hidden=external;$('filters').hidden=external;$('note').hidden=true;$('sort-note').hidden=true;return external}
+function schedule(seconds){clearTimeout(poll);poll=setTimeout(()=>{if(document.visibilityState==='visible')load();else schedule(60)},seconds*1000)}
+async function load(force=false){
+ clearTimeout(poll);clearTimeout(debounce);if(controller)controller.abort();const requestId=++sequence;const store=$('store').value;
+ if(activeStore!==store){clearCards();notice('');activeStore=store}saveUrl();
+ if(storeDetails()){clearCards();$('grid').setAttribute('aria-busy','false');notice('');return}
+ if(fetchedAt&&Date.now()-new Date(fetchedAt).getTime()>=600000)clearCards();
+ loading();if(!$('status').textContent||force)notice(force?'Kontrollerar butikens senaste erbjudanden…':'Hämtar butikens erbjudanden…');
+ controller=new AbortController();const query=new URLSearchParams({store,q:$('search').value,membership:$('membership').value,expiry:$('expiry').value,sort:$('sort').value,limit:String(limit)});
+ $('refresh').disabled=true;
+ try{
+  const response=await fetch('/api/offers?'+query,{method:force?'POST':'GET',headers:force?{'X-FoodSale-Request':'1'}:{},signal:controller.signal,cache:'no-store'});
+  const data=await response.json();if(requestId!==sequence)return;
+  if(!response.ok||data.status!=='ok')throw new Error(data.message||'Erbjudandena kunde inte hämtas. Försök igen om en stund.');
+  $('grid').innerHTML=data.cards;$('total').textContent=data.total;$('members').textContent=data.members;$('ending').textContent=data.ending;
+  $('results-count').textContent=`${data.matches} av ${data.total} erbjudanden`;
+  fetchedAt=data.fetchedAt;const date=new Date(fetchedAt);$('freshness').textContent='Hämtat '+date.toLocaleString('sv-SE',{timeZone:'Europe/Stockholm',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+' · svensk tid';
+  $('note').textContent=data.note||'';$('note').hidden=!data.note;$('sort-note').hidden=!['discount','saving'].includes($('sort').value);
+  notice(data.message||'',data.stale||data.refreshFailed?'warning':'info');
+  $('empty').hidden=data.matches>0;$('more').hidden=!data.hasMore;$('all').hidden=!data.hasMore;
+  $('page-note').textContent=data.hasMore?`Visar ${data.shown} av ${data.matches}. Sökningen omfattar alla erbjudanden.`:'';
+  $('more').textContent='Visa 48 till';$('all').textContent=`Visa alla ${data.matches}`;
+  schedule(data.refreshing?3:60);
+ }catch(error){if(error.name==='AbortError'||requestId!==sequence)return;clearCards();notice(error.message||'Anslutningen misslyckades. Försök igen.','error');schedule(30)}
+ finally{if(requestId===sequence){$('grid').setAttribute('aria-busy','false');$('refresh').disabled=false}}
+}
+$('filters').addEventListener('submit',event=>{event.preventDefault();limit=48;load()});
+$('search').addEventListener('input',()=>{clearTimeout(debounce);limit=48;debounce=setTimeout(()=>load(),200)});
+for(const id of ['membership','expiry','sort'])$(id).addEventListener('change',()=>{limit=48;load()});
+$('store').addEventListener('change',()=>{limit=48;load()});$('refresh').addEventListener('click',()=>load(true));
+$('reset').addEventListener('click',()=>{$('search').value='';$('membership').value='all';$('expiry').value='all';$('sort').value='source';limit=48;load()});
+$('more').addEventListener('click',()=>{limit=Math.min(2000,limit+48);load()});$('all').addEventListener('click',()=>{limit=2000;load()});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')load()});load();
+</script>
+</body></html>
+"""
+CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-VvK7FVdLHe+RtLWPrV/ef7DhX6EXusnbJQyeoXT/m6A='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+
+MEMBERSHIP = {'all': 'Alla erbjudanden', 'general': 'Utan medlemskrav', 'member': 'Medlemspriser'}
+EXPIRY = {'all': 'Alla slutdatum', 'today': 'Slutar idag', 'soon': 'Inom 3 dagar'}
+SORTING = {'source': 'Butikens ordning', 'discount': 'Störst prissänkning (%)',
+           'saving': 'Störst besparing (kr/enhet)', 'expiry': 'Slutar snart', 'name': 'Namn A–Ö'}
 
 
+def store_snapshot(store_key, force=False):
+    config = STORES[store_key]
+    today = dt.datetime.now(STOCKHOLM).date().isoformat()
+    if config['provider'] == 'lidl':
+        # One shared regional offers cache, not nested five-minute caches.
+        lidl_store(store_key)
+        key = ('lidl', today)
+        loader = lambda: fetch_lidl(store_key)
+    else:
+        key = (store_key, today)
+        loader = lambda: fetch_coop(store_key) if config['provider'] == 'coop' else fetch_offers(store_key)
+    snapshot = offer_cache.get(key, loader, force=force)
+    age = (dt.datetime.now(STOCKHOLM) - dt.datetime.fromisoformat(snapshot.value['fetchedAt'])).total_seconds()
+    if age >= 600:
+        raise ExtractionUnavailable('De sparade priserna är för gamla. Kontrollera butikens officiella erbjudanden eller försök igen.')
+    return snapshot
 
-def theme_css(dark):
-    colors = dict(bg='#17191d', card='#22262c', text='#f1f2f5', muted='#b8bfc9',
-                  border='#414854', accent='#ffaaa3', input='#252a32') if dark else dict(
-                  bg='#f6f5f1', card='#ffffff', text='#222222', muted='#62625d',
-                  border='#d3d1c9', accent='#a12d26', input='#ffffff')
-    variables = ';'.join(f'--viewer-{key}:{value}' for key, value in colors.items())
-    return '<style>:root,.stApp{' + variables + '}'+ r"""
-    .stApp {color-scheme:__SCHEME__}
-    [data-testid="stHeader"] {background:var(--viewer-bg)}
-    [data-testid="stHeading"], [data-testid="stWidgetLabel"],
-    [data-testid="stCaptionContainer"], [data-testid="stRadio"] label,
-    [data-testid="stMarkdownContainer"] {color:var(--viewer-text)!important}
-    [data-testid="stTextInput"] input, [role="combobox"],
-    [data-baseweb="select"]>div, [data-baseweb="select"]>div>div {background:var(--viewer-input)!important;color:var(--viewer-text)!important;border-color:var(--viewer-border)!important}
-    [data-testid="stTextInput"] input::placeholder {color:var(--viewer-muted)}
-    [data-baseweb="popover"], [role="listbox"], [role="option"] {background:var(--viewer-card)!important;color:var(--viewer-text)!important}
-    [role="option"]:hover {background:var(--viewer-border)!important}
-    [data-testid="stBaseButton-secondary"], [data-testid="stBaseLinkButton-secondary"] {background:var(--viewer-card);color:var(--viewer-text);border-color:var(--viewer-border)}
-    [data-testid="stBaseButton-primary"] {background:#a12d26;color:white;border-color:#a12d26}
-    .offer-picture {background:white;border-radius:10px}
-    </style>""".replace('__SCHEME__', 'dark' if dark else 'light')
+
+@asynccontextmanager
+async def lifespan(application):
+    yield
+    # All network calls have finite timeouts; finish workers on graceful shutdown.
+    offer_cache.close()
+
+
+app = FastAPI(title='Food Sale · Halmstad', version='2.0', lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware('http')
+async def response_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Content-Security-Policy'] = CSP
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    return response
+
+
+@app.get('/', response_class=HTMLResponse)
+async def index():
+    # The shell renders without waiting for any grocery source.
+    return HTMLResponse(PAGE)
+
+
+@app.get('/healthz')
+async def health():
+    return {'status': 'ok'}
+
+
+def offers_response(store, q, membership, expiry, sort, limit, force=False):
+    config = STORES[store]
+    if config['provider'] == 'official':
+        return JSONResponse(dict(status='official', store=config['name'], source=config['source'],
+            message='Produktlistan är inte tillgänglig här. Öppna butikens officiella erbjudanden.'))
+    try:
+        snapshot = store_snapshot(store, force=force)
+        result = snapshot.value
+        today = dt.datetime.now(STOCKHOLM).date()
+        current = select_offers(result['offers'], today=today)
+        selected = select_offers(current, q, MEMBERSHIP[membership], EXPIRY[expiry], SORTING[sort], today)
+        shown = selected[:limit]
+        message = ''
+        if snapshot.failed:
+            message = 'Uppdateringen misslyckades. Visar en nyligen sparad prislista; priserna kan ha ändrats.'
+        elif snapshot.stale:
+            message = 'Visar sparade erbjudanden medan aktuella priser hämtas i bakgrunden.'
+        elif snapshot.refreshing:
+            message = 'Visar de senast hämtade erbjudandena. En ny kontroll pågår i bakgrunden.'
+        return JSONResponse(dict(status='ok', store=config['name'], source=config['source'],
+            fetchedAt=result['fetchedAt'], stale=snapshot.stale, refreshing=snapshot.refreshing,
+            refreshFailed=snapshot.failed, message=message, note=result.get('note', ''),
+            total=len(current), members=sum(o['member'] for o in current),
+            ending=sum(o['end'] == today.isoformat() for o in current),
+            matches=len(selected), shown=len(shown), hasMore=len(selected) > len(shown),
+            cards=''.join(card(o, today) for o in shown)))
+    except (ExtractionUnavailable, urllib.error.URLError, OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        # Source errors may contain anonymous-client keys. Never return their raw text.
+        return JSONResponse(dict(status='unavailable', store=config['name'], source=config['source'],
+            message='Erbjudandena kunde inte hämtas. Kontrollera butikens officiella sida eller försök igen om en stund.'),
+            status_code=503, headers={'Retry-After': str(max(1, int(getattr(exc, 'retry_after', 30))))})
+
+
+@app.api_route('/api/offers', methods=['GET', 'POST'])
+def offers(request: Request,
+           store: Literal['willys-oster', 'willys-flygstaden', 'hemkop-c', 'coop-stora', 'coop-gamletull', 'coop-flygaregatan', 'coop-furuvagen', 'coop-fyllinge', 'xtra-snostorp', 'lidl-torpaledsvagen', 'lidl-gesallgatan', 'lidl-tegelbruket', 'ica-hogskolan', 'ica-flygstaden', 'ica-vallas', 'ica-sondrum', 'ica-frosakull', 'citygross', 'tempo-backagard'] = 'willys-oster',
+           q: str = Query(default='', max_length=200),
+           membership: Literal['all', 'general', 'member'] = 'all',
+           expiry: Literal['all', 'today', 'soon'] = 'all',
+           sort: Literal['source', 'discount', 'saving', 'expiry', 'name'] = 'source',
+           limit: int = Query(default=48, ge=1, le=2000)):
+    force = request.method == 'POST'
+    if force:
+        origin = request.headers.get('origin')
+        if (request.headers.get('x-foodsale-request') != '1' or
+            request.headers.get('sec-fetch-site') not in (None, 'same-origin', 'none') or
+            (origin and (urllib.parse.urlsplit(origin).scheme not in ('http', 'https') or
+                         urllib.parse.urlsplit(origin).netloc != request.headers.get('host')))):
+            raise HTTPException(status_code=403, detail='Uppdatering måste göras från appen.')
+    return offers_response(store, q, membership, expiry, sort, limit, force=force)
+
 
 def main():
-    st.set_page_config(page_title='Food Sale · Halmstad', page_icon='🛒', layout='wide')
-    initial = 1 if st.query_params.get('theme') == 'dark' else 0
-    left, right = st.columns([4, 1], vertical_alignment='center')
-    with left:
-        st.html('<div class="eyebrow"><span class="brand-mark">fs.</span> Food Sale / Halmstad</div>')
-    with right:
-        appearance = st.radio('Utseende', ['Ljust', 'Mörkt'], index=initial, horizontal=True, key='appearance', label_visibility='collapsed')
-    dark = appearance == 'Mörkt'
-    selected = 'dark' if dark else 'light'
-    if st.query_params.get('theme') != selected:
-        st.query_params['theme'] = selected
-    st.html(theme_css(dark) + CSS)
-    default_store = st.query_params.get('store', 'willys-oster')
-    if default_store not in STORES:
-        default_store = 'willys-oster'
-    choices = list(STORES)
-    store_key = st.selectbox('Välj butik', choices, index=choices.index(default_store),
-        format_func=lambda key: STORES[key]['name'] + (' · Officiell sida' if STORES[key]['provider'] == 'official' else ''),
-        key='store', help='12 butiker har produktlistor här. ICA, City Gross och Tempo öppnas på sina officiella erbjudandesidor.')
-    if st.query_params.get('store') != store_key:
-        st.query_params['store'] = store_key
-    config = STORES[store_key]
-    st.html('<section class="hero"><h1>Veckans fynd, nära dig.</h1><p>' +
-            escape(config['name']) + ' · ' + escape(config['address']) + '</p></section>')
-    st.caption('12 butiker med produktvy · 7 butiker via officiell erbjudandesida')
-    if config['provider'] == 'official':
-        st.info('Den här butikens erbjudanden kan ännu inte visas som en produktlista här. '
-                'Öppna butikens officiella erbjudanden nedan. Sökning och sortering i Food Sale är inte tillgängliga för denna butik.')
-    else:
-        offers_view(store_key)
-    st.html('<div class="footnote">Offentliga butikserbjudanden. Medlemspriser kräver medlemskap hos respektive kedja. '
-            'Personliga kuponger och lokalt lagersaldo ingår inte. Bilder hämtas från butikernas bildleverantörer. Fristående visare.</div>')
-    st.link_button('Se butikens officiella erbjudanden ↗', config['source'])
-
-
-@st.fragment(run_every=60)
-def offers_view(store_key='willys-oster'):
-    config = STORES[store_key]
-    today = dt.datetime.now(STOCKHOLM).date()
-    try:
-        with st.spinner('Hämtar butikens erbjudanden…'):
-            result = fetch_lidl(store_key) if config['provider'] == 'lidl' else cached_offers(today.isoformat(), store_key)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, OverflowError):
-        st.error('Erbjudandena kunde inte hämtas. Kontrollera anslutningen eller försök igen. Inga gamla priser visas.')
-        if st.button('Försök igen'):
-            cached_offers.clear(today.isoformat(), store_key)
-            if config['provider'] == 'lidl':
-                lidl_campaigns.clear(today.isoformat())
-            st.rerun()
-        return
-    fetched_at = dt.datetime.fromisoformat(result['fetchedAt']).astimezone(STOCKHOLM)
-    age_seconds = max(0, (dt.datetime.now(STOCKHOLM) - fetched_at).total_seconds())
-    if age_seconds > 300:
-        st.warning('Visar sparade erbjudanden från ' + fetched_at.strftime('%H:%M') +
-                   '. Hämtar aktuella priser i bakgrunden. Om uppdateringen misslyckas kan priserna ha ändrats.')
-    if result.get('note'):
-        st.caption(result['note'])
-    # Cache age and validity are separate: discard expired offers even within a cached response.
-    current = select_offers(result['offers'], today=today)
-    members = sum(o['member'] for o in current)
-    ending = sum(o['end'] == today.isoformat() for o in current)
-    st.html('<div class="summary">' + ''.join(
-        f'<div class="summary-item"><strong>{number}</strong><span>{label}</span></div>'
-        for number, label in [(len(current), 'aktuella erbjudanden'), (members, 'medlemspriser'), (ending, 'slutar idag')]) + '</div>')
-    search_col, member_col = st.columns([2, 1], vertical_alignment='bottom')
-    with search_col:
-        query = st.text_input('Sök produkter', placeholder='Sök vara, varumärke eller storlek…', key='search')
-    with member_col:
-        mode = st.selectbox('Medlemskrav', ['Alla erbjudanden', 'Utan medlemskrav', 'Medlemspriser'], key='membership')
-    expiry_col, order_col, refresh_col = st.columns([1.3, 1.3, 1], vertical_alignment='bottom')
-    with expiry_col:
-        expiry = st.selectbox('Giltighet', ['Alla slutdatum', 'Slutar idag', 'Inom 3 dagar'], key='expiry')
-    with order_col:
-        order = st.selectbox('Sortera', ['Butikens ordning', 'Störst prissänkning (%)', 'Störst besparing (kr/enhet)', 'Slutar snart', 'Namn A–Ö'], key='sort',
-                             help='Rabatten beräknas mot visat ordinarie pris. Flerköp räknas per vara; viktpriser per kg. Sorter kan skilja sig. Okända jämförelser visas sist.')
-    with refresh_col:
-        if st.button('↻ Uppdatera', use_container_width=True):
-            cached_offers.clear(today.isoformat(), store_key)
-            if config['provider'] == 'lidl':
-                lidl_campaigns.clear(today.isoformat())
-            st.rerun()
-    offers = select_offers(current, query, mode, expiry, order, today)
-    if order in ('Störst prissänkning (%)', 'Störst besparing (kr/enhet)'):
-        st.caption('Beräknat från visat ordinarie pris. Flerköp räknas per vara, viktpriser per kg/l. '
-                   'Priset kan variera mellan sorter. Erbjudanden utan jämförbara priser visas sist.')
-    fetched = dt.datetime.fromisoformat(result['fetchedAt']).astimezone(STOCKHOLM).strftime('%H:%M')
-    st.html(f'<div class="results-bar"><strong>{len(offers)} av {len(current)} erbjudanden</strong>'
-            f'<span>Hämtat {fetched} · Svensk tid · Kontrolleras automatiskt</span></div>')
-    if not offers:
-        st.info('Inga matchningar. Prova ett annat sökord eller välj Alla slutdatum och Alla erbjudanden.')
-        return
-    # Filtering always uses the full dataset; only the initial DOM is kept small.
-    filter_signature = (store_key, query, mode, expiry, order)
-    if st.session_state.get('display_filter') != filter_signature:
-        st.session_state['display_filter'] = filter_signature
-        st.session_state['show_all_offers'] = False
-    show_all = st.session_state.get('show_all_offers', False)
-    visible = offers if show_all else offers[:48]
-    st.html('<div class="offer-grid">' + ''.join(card(offer, today) for offer in visible) + '</div>')
-    if len(visible) < len(offers):
-        st.caption(f'Visar {len(visible)} av {len(offers)} matchningar. Sökningen omfattar alla erbjudanden.')
-        if st.button(f'Visa alla {len(offers)} erbjudanden', use_container_width=True):
-            st.session_state['show_all_offers'] = True
-            st.rerun()
+    parser = argparse.ArgumentParser(description='Food Sale · Halmstad')
+    parser.add_argument('--host', default=os.environ.get('HOST', '0.0.0.0' if os.environ.get('PORT') else '127.0.0.1'))
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '8000')))
+    parser.add_argument('--no-browser', action='store_true', help='Öppna inte webbläsaren automatiskt')
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error('Porten måste vara mellan 1 och 65535.')
+    if not args.no_browser and args.host in ('127.0.0.1', 'localhost') and not os.environ.get('PORT'):
+        def open_when_ready():
+            url = f'http://127.0.0.1:{args.port}'
+            for _ in range(100):
+                try:
+                    with urllib.request.urlopen(url + '/healthz', timeout=.3) as response:
+                        if response.status == 200:
+                            webbrowser.open(url)
+                            return
+                except OSError:
+                    time.sleep(.1)
+        threading.Thread(target=open_when_ready, daemon=True).start()
+    import uvicorn
+    uvicorn.run(app, host=args.host, port=args.port, log_level='info', access_log=False)
 
 
 if __name__ == '__main__':

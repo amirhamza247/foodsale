@@ -1,68 +1,78 @@
-# Food Sale · Halmstad
+# Food Sale · FastAPI
 
-One Python application file with a selector for 19 Halmstad grocery stores. **12 stores have integrated product lists; seven have official-page links only. The requested identical product view for all 19 is not complete.** No store login is used; personal coupons are excluded.
+A single-file Python web app for Halmstad grocery offers. All Python, HTML, CSS, and JavaScript are in `app.py`; there is no Streamlit dependency, frontend build, browser automation, or external UI library.
 
-## Store support
+## Run locally
 
-| Stores | Current support |
-|---|---|
-| Willys Öster and Flygstaden | Current product cards, membership, search, expiry, comparable-price sorting |
-| Hemköp Halmstad C | Same product view; Klubb Hemköp labels |
-| Stora Coop, Gamletull, Flygaregatan, Furuvägen, Fyllinge, X:-tra Snöstorpsvägen | Current product cards, membership, search, expiry. This feed supplies no ordinary prices, so calculated savings remain unknown. Grouped variant names are searchable and expandable. |
-| Lidl Torpaledsvägen, Gesällgatan, Tegelbruket | Current published campaigns; dates, Lidl Plus, search and reference-price comparisons when available. Branch identity is checked. Prices must agree across all three Halmstad regions; disagreement stops the feed rather than selecting an arbitrary price. No local stock guarantee. |
-| Maxi ICA Högskolan, Maxi ICA Flygstaden, ICA Supermarket Vallås, ICA Supermarket Söndrum, ICA Nära Frösakull | Official offer links only. All five direct offer-page requests returned HTTP 403 during verification. |
-| Tempo Halmstad Bäckagård | Official offer link only. Its embedded publication provider explicitly refused automated scraping. |
-| City Gross Halmstad | Official store/leaflet link only. The tested product-offer service returned zero offers, while current leaflet links were available. A complete product-level adapter remains unresolved. |
-
-These fallbacks are labelled in the selector and never show another store's products or fabricated data. Finishing the seven product integrations requires usable permitted data sources. A general scraping package does not establish those sources or permission.
-
-- Light/dark appearance, retained in the URL across reloads.
-- Overview of active offers, chain-specific member deals, and offers ending today.
-- Search across products, brands, sizes, and descriptions; accents and word order are handled.
-- Membership and expiry filters, plus expiry/name sorting.
-- Product images, multi-buy wording, units, purchase limits, and validity dates.
-- All results pages are checked. Cached prices are rechecked for date validity before display.
-- Shared five-minute data cache with background refresh. A recent snapshot is returned immediately while refreshing; a visible warning labels data older than five minutes. Streamlit limits this stale window to one extra five-minute TTL by default, then requires a successful fetch. The page checks once a minute while active. Expired offers are always filtered out.
-- Store metadata is cached for 24 hours per branch, independent initial requests overlap, and date parsing is memoized. Offer cache keys include branch and date. Lidl campaign reads are shared across its three branches with a single bounded background-refresh cache; caches are not nested.
-- Initially renders 48 cards; search and filters cover the entire dataset. Use “Visa alla” to display all matches on the same page.
-- Manual refresh invalidates the selected branch; Lidl refresh invalidates its shared regional campaign cache. Caches are memory-only and do not survive restarts or hosting sleep.
-
-## Run
-
-From this repository, with a Python version supported by Streamlit:
+Requires Python 3.11 or newer. From the repository folder:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m streamlit run app.py
+python app.py
 ```
 
-Python 3.15 and Streamlit 1.67.0 were used for local verification. Internet access is required. Stop with Ctrl+C. Images are requested from each chain's public image providers.
+The app opens `http://127.0.0.1:8000` after the server responds. Keep Terminal running; stop with Ctrl+C. To start without opening a browser, use `python app.py --no-browser`. For an occupied port, choose another, for example `python app.py --port 8001`. On Windows activate the environment with `.venv\Scripts\activate`.
 
-## Streamlit Community Cloud
+Alternatively:
 
-Push `app.py`, `requirements.txt`, and `.streamlit/config.toml` to GitHub. Keep the config in that subdirectory: a root-level `config.toml` is not loaded by Streamlit. In Community Cloud choose the repository, branch, and `app.py` entrypoint. Select a compatible Python version and deploy. Verify that offers load from the hosting environment before sharing its URL.
+```sh
+python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+```
 
-The chains’ website endpoints are undocumented and may change or restrict cloud access. Local testing does not establish hosted reliability. This is an independent offers viewer.
+## Interface
+
+- Native browser controls update the offer grid without reloading the page.
+- Light/dark appearance follows the system initially and persists in local storage and the URL. Store selection also persists in the URL.
+- Search handles accents and word order, and includes grouped Coop variety names.
+- Membership and expiry filters; source, name, expiry, percentage reduction, and saving-per-priced-unit sorts.
+- First 48 cards load initially; show more or all matches. Search always checks the complete retrieved dataset.
+- Images load lazily. Prices, multi-buy wording, membership, dates, limits, and grouped varieties are preserved. Coop tiered prices and “buy X, pay Y” offers are supported.
+- Retrieval time, loading/error/empty states, stale-data warnings, and the official source link remain visible where appropriate.
+
+## Store support
+
+19 selectable stores; **12 integrated product views and seven official-page links only**. Changing framework does not resolve the seven missing data sources.
+
+| Stores | Support |
+|---|---|
+| Willys Öster and Flygstaden | Product cards, search, filters, comparable-price savings |
+| Hemköp Halmstad C | Product cards, search, filters, Klubb Hemköp labels and comparable-price savings |
+| Stora Coop, Gamletull, Flygaregatan, Furuvägen, Fyllinge, X:-tra Snöstorpsvägen | Product cards, search and filters. Source supplies no ordinary prices, so calculated savings remain unknown. |
+| Lidl Torpaledsvägen, Gesällgatan, Tegelbruket | Shared published campaigns; prices must agree across all three Halmstad regions. Branch identity is checked. Reference-price savings appear only when supported by the data. |
+| Maxi ICA Högskolan, Maxi ICA Flygstaden, ICA Supermarket Vallås, ICA Supermarket Söndrum, ICA Nära Frösakull | Official-page links; direct access was refused in earlier checks. |
+| Tempo Halmstad Bäckagård | Official-page link; publication provider refused automated extraction. |
+| City Gross Halmstad | Official store/leaflet link; a complete product feed remains unresolved. |
+
+No personal coupons, account logins, purchases, or local stock guarantees. Missing or incompatible comparison prices are never invented. “Biggest price drop” compares the source's displayed ordinary/reference price with the offer, rather than tracking historical price changes.
+
+## Caching and responsiveness
+
+The page shell and health endpoint do not wait for grocery websites. Synchronous extraction runs on worker threads rather than the asynchronous request loop. Three refresh workers bound concurrent source work, and simultaneous visitors share a single extraction per store/date. Lidl's three branches share one regional offers cache.
+
+Public offers are fresh for five minutes. Recent snapshots can be displayed for up to five additional minutes during background refresh, with a warning. Failed refreshes do not extend the snapshot age; over-age prices are refused. Expired offers are filtered again for every response. Metadata is cached separately for 24 hours with bounded entries and single-flight loading. There are no nested five-minute offers caches.
+
+Manual refresh is coalesced and limited to one check per 30 seconds per cached source. Failures have a cooldown; source Retry-After is honored. HTTP reads have finite timeouts, bounded response sizes, and at most one retry for selected transient server errors. Access refusals are not retried automatically. Lidl HTML is processed in bounded batches to reduce peak memory.
+
+Caches are process-local and disappear on restart or hosting sleep. **Run one worker** for this small app; additional workers have separate caches and can duplicate extraction. The app does not create a database or external cache service.
+
+## Render
+
+This version needs a Python Web Service; Streamlit Community Cloud cannot run it as a Streamlit app. Render configuration, following its [official FastAPI guide](https://render.com/docs/deploy-fastapi):
+
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1`
+- Health check path: `/healthz`
+
+Use the repository folder containing `app.py` as the service root. No browser binaries or secrets are required. The direct `python app.py --no-browser` launcher also honors the host's `PORT` environment variable.
+
+**Not deployed or verified from Render.** After deployment, check every integrated chain from the actual host before sharing. Local success does not establish cloud access. Hosting cold starts, source latency, and image downloads can still cause delays.
 
 ## Verification
 
-The improvement pass checked 257 live offers, membership and expiry filtering, accent/multiword search, sorting, empty results, expired records, escaped HTML, incomplete source responses, and network failures. Browser checks covered light/dark appearance, search, expiry filtering, theme persistence, and a 390-pixel phone layout. No deployment or performance improvement is claimed from those checks.
+Automated API checks cover all 19 store states, 12 product views using recorded fixtures, full-dataset search, membership, pagination, input validation, escaped source content, refresh-origin checks, stale warnings, and graceful source errors. Cache checks cover simultaneous cold reads, one background refresh, replacement, failure, branch isolation, and the hard age cap. Pricing regression checks cover multi-buy totals, incompatible units, percentage/saving sorts, and the newly encountered Coop deal formats.
 
-## Caching verification
+JavaScript interactions were tested with an emulated DOM against a real local HTTP API: initial/all cards, empty search, reset, store/member changes, persistent theme, official-page fallback, and manual refresh. This was not visual browser testing; the user handles visual checks.
 
-Verified background refresh returns a stale snapshot without blocking, concurrent readers share one refresh, completed refreshes replace cached values, and over-age data is refused if the source fails. UI checks cover the initial 48 cards, showing all 257, full-dataset search, and stale-data warnings. One local run measured the uncached fetch at 1.73 seconds before and 1.28 seconds after; a warm cache read was about 0.0009 seconds. These measure server data access, not total page load, and are not a hosted performance guarantee. Hosting cold starts and image downloads can still add latency.
-
-## Biggest price drops
-
-Under Sortera, choose `Störst prissänkning (%)` for descending relative reductions, or `Störst besparing (kr/enhet)` for descending kronor saved per source-priced unit (item, kg, or litre). Multi-buy totals are divided by the required item count. Missing, ranged, or incompatible price comparisons go last. Cards show the calculated reduction and saving. Calculations use the displayed ordinary price; grouped varieties can differ. These are offer-versus-ordinary comparisons, not historical price tracking. Verified against 257 live offers and focused tests for bundles, weight prices, unknown prices, and descending order.
-
-Audit fixes preserve source mix-and-match qualifiers, reject conflicting display units even when a numeric promotion price exists, and validate nested source shapes before parsing. Automated regression checks cover these cases and the friendly error state.
-
-
-## Multi-store verification
-
-Automated live-data checks on 15 November 2026 returned 257 offers for each Willys, 65 for Hemköp, 50/43/39/19/38 for Stora Coop/Gamletull/Flygaregatan/Furuvägen/Fyllinge, 45 for X:-tra, and 174 published campaigns for each Lidl branch (the shared regional dataset). Counts vary with the date. All three Lidl branch addresses were verified against their official structured store pages.
-
-Focused checks covered branch identity, complete Coop groups, grouped variant search, conflicting Lidl regional prices, malformed source data, current-date filtering, duplicate campaign records, membership labels, store/date/schema cache isolation and targeted invalidation. Streamlit AppTest covered all 19 choices, the 12 product views, seven explicit fallback states, membership filtering, full-data search, store/theme URL persistence, 48-card rendering, and reset of “show all” on store changes. Existing pricing, multi-buy, nested-data and friendly-error regressions pass. Browser automation was deliberately skipped at the user's request. Cloud-side access remains unverified.
+Final local live checks passed for all 12 integrated branches. There were 12 successful extraction attempts out of 13 including the initial Stora Coop failure that prompted the format fix. Peak macOS process RSS during the extraction run was 95.3 MiB. One real HTTP smoke test measured the shell at 0.93 ms, cold Willys offers at 0.970 seconds, and a warm filtered response at 4.91 ms. These are local observations, not end-to-end page-load or hosted performance guarantees. Detailed benchmark evidence is supplied with the migration report.
