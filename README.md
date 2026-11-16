@@ -109,3 +109,16 @@ Your supplied [live Render URL](https://foodsale-mycity.onrender.com/) timed out
 
 
 A final queue-enabled Linux smoke test with 512 MiB and 0.5 CPU returned 261 Högskolan offers in 2.29 seconds, with a 7 ms warm response and about 219 MiB peak cgroup memory. This is one local container sample, not a Render guarantee. Your existing local `.venv` now has the required Playwright package and its standard Chromium shell installed; restart the app to use them.
+
+
+## Keyword search and typo tolerance
+
+Search runs in memory over the selected store's complete current offers. It uses names, brands, sizes, descriptions and grouped varieties, preserving accent folding and word-order independence. Full name matches and name/brand keyword matches rank first in the default ordering; explicitly selected price/date/alphabetic sorts are retained.
+
+If the current membership/expiry filters yield no exact keyword matches, RapidFuzz tries conservative word and compound-edge spelling corrections (one edit for 4–9 letters, up to two for longer words, with at least 80% similarity). Approximate cards say **Liknande träff**, and a message explains that there were no exact matches. Short words and dietary/negative terms are not fuzzy-corrected; candidate dietary words are protected too. Search is a text tool, not a verified dietary-suitability filter.
+
+Numbers and known units stay literal. Measurements are bound as pairs: `450 g` cannot match `450 ml` plus an unrelated `20 g`. Unit aliases such as gram/grams/g and decimal comma/dot are normalized; different quantities or different units are not converted into each other. Long queries over eight tokens retain strict keyword behavior. Search does not infer recipes, synonyms or semantic intent.
+
+A bounded cache holds up to 4,096 public product-text documents. It does not cache visitor queries, product eligibility or search responses. Text changes generate new entries; current dates, membership and expiry are filtered on every request. Search adds no upstream calls, embeddings, database or external service.
+
+Automated tests cover typo fallback, exact ranking, protected words, number/unit pairs, source-text changes, expiry/membership, variants, explicit sorting, unchanged cached offers, full-result pagination and API labels. Local measurements on 301 recorded offers took about 0.8–9.1 ms median per query with Python allocation tracing enabled, and about 0.5 MB additional traced allocations. These measure search selection only, not fetching, page rendering or Render performance. Search changes are not deployed automatically.

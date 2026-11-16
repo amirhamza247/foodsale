@@ -27,6 +27,8 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from rapidfuzz import process
+from rapidfuzz.distance import OSA
 
 # All caches contain public data only and are private to this server process.
 # In-memory state disappears on restart; run one worker to avoid duplicate caches.
@@ -1014,10 +1016,127 @@ def search_key(value):
                    if not unicodedata.combining(c))
 
 
+# Search only public offer metadata; this bounded cache stores no visitor queries.
+SEARCH_UNITS = {'g': 'g', 'gr': 'g', 'gram': 'g', 'grams': 'g', 'kg': 'kg', 'kilogram': 'kg',
+                'mg': 'mg', 'milligram': 'mg', 'hg': 'hg', 'hektogram': 'hg',
+                'mm': 'mm', 'cm': 'cm', 'dm': 'dm', 'm': 'm', 'meter': 'm',
+                'oz': 'oz', 'ounce': 'oz', 'lb': 'lb', 'lbs': 'lb',
+                'ml': 'ml', 'milliliter': 'ml',
+                'cl': 'cl', 'centiliter': 'cl', 'dl': 'dl', 'deciliter': 'dl',
+                'l': 'l', 'liter': 'l', 'litre': 'l', 'liters': 'l', 'st': 'st', 'styck': 'st', 'stycken': 'st',
+                'pack': 'pack', '%': '%'}
+SEARCH_TOKEN = re.compile(r'\d+(?:[.,]\d+)?|[^\W\d_]+|%', re.UNICODE)
+SEARCH_MEASURE = re.compile(r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*('
+                            + '|'.join(sorted(SEARCH_UNITS, key=len, reverse=True)) + r')(?![a-z])')
+SEARCH_PROTECTED = frozenset(('utan', 'med', 'ej', 'inte', 'fri', 'fritt', 'fria', 'no', 'non', 'free', 'eko'))
+SEARCH_DIET_PREFIXES = ('laktos', 'gluten', 'mjolkfri', 'notfri', 'aggfri', 'sockerfri',
+                        'osotad', 'osaltad', 'alkoholfri', 'vegan', 'vegetar', 'ekolog')
+
+
+def search_number(value):
+    integer, _, fraction = value.replace(',', '.').partition('.')
+    integer, fraction = integer.lstrip('0') or '0', fraction.rstrip('0')
+    return integer + ('.' + fraction if fraction else '')
+
+
+def search_tokens(value):
+    normalized = search_key(value)
+    words = []
+    for token in SEARCH_TOKEN.findall(normalized):
+        words.append(search_number(token) if token[0].isdigit() else SEARCH_UNITS.get(token, token))
+    measures = frozenset((search_number(number), SEARCH_UNITS[unit])
+                         for number, unit in SEARCH_MEASURE.findall(normalized))
+    return tuple(dict.fromkeys(words)), measures
+
+
+def search_protected(term):
+    return (not term.isalpha() or term in SEARCH_UNITS.values() or term in SEARCH_PROTECTED
+            or term.startswith(SEARCH_DIET_PREFIXES) or term.endswith(('fri', 'fritt', 'fria')))
+
+
+def search_literal(term, words):
+    if term in words:
+        return True
+    if search_protected(term):
+        # Dietary/negative terms, numbers and units require complete literal tokens.
+        return False
+    return any(term in word for word in words if word.isalpha())
+
+
+@lru_cache(maxsize=4096)
+def search_document(name, brand, volume, description, variants):
+    primary, _ = search_tokens(name + ' ' + brand)
+    words, measures = search_tokens(' '.join((name, brand, volume, description, variants)))
+    return primary, words, measures
+
+
+def search_offers(offers, query):
+    terms, measures = search_tokens(query)
+    if not terms:
+        return offers
+    strict_terms = tuple(term for term in terms if search_protected(term))
+    documents = []
+    for offer in offers:
+        document = search_document(offer['name'], offer['brand'], offer['volume'],
+                                   offer['description'], offer.get('search_extra', ''))
+        if measures <= document[2] and all(search_literal(term, document[1]) for term in strict_terms):
+            documents.append((offer, document))
+    exact = []
+    for offer, (primary, words, _) in documents:
+        if all(search_literal(term, words) for term in terms):
+            # Name/brand matches outrank matches found only in descriptions/variants.
+            rank = (search_key(offer['name']).strip() == search_key(query).strip(),
+                    sum(term in primary for term in terms),
+                    sum(search_literal(term, primary) for term in terms))
+            exact.append((rank, offer))
+    if exact:
+        return [offer for _, offer in sorted(exact, key=lambda item: item[0], reverse=True)]
+    # Long natural-language requests keep strict keyword behavior; no broad expansion.
+    if len(terms) > 8:
+        return []
+    vocabulary = sorted({word for _, (_, words, _) in documents for word in words
+                         if len(word) >= 4 and not search_protected(word)})
+    corrections, whole_corrections = {}, {}
+    for term in terms:
+        if len(term) < 4 or search_protected(term):
+            continue
+        edits = 1 if len(term) < 10 else 2
+        # Swedish compounds often put the product word at an edge: snabb+kaffe.
+        # Bound the edge lengths and never split protected dietary words.
+        forms = {word: {word} | {part for size in range(max(4, len(term) - edits), len(term) + edits + 1)
+                                for part in (word[:size], word[-size:])}
+                 for word in vocabulary}
+        candidates = sorted({part for parts in forms.values() for part in parts})
+        matches = {word: 1 - distance / max(len(term), len(word))
+                   for word, distance, _ in process.extract(term, candidates, scorer=OSA.distance,
+                                                          score_cutoff=edits, limit=None)
+                   if 1 - distance / max(len(term), len(word)) >= .8}
+        corrections[term] = {word: max((matches.get(part, 0) for part in parts), default=0)
+                             for word, parts in forms.items()}
+        whole_corrections[term] = {word: matches[word] for word in vocabulary if word in matches}
+    approximate = []
+    for offer, (primary, words, _) in documents:
+        scores, primary_matches = [], 0
+        for term in terms:
+            if search_literal(term, words):
+                scores.append(1)
+                primary_matches += search_literal(term, primary)
+                continue
+            score = max((corrections.get(term, {}).get(word, 0) for word in words), default=0)
+            if not score:
+                break
+            scores.append(score)
+            primary_matches += max((whole_corrections.get(term, {}).get(word, 0) for word in primary), default=0)
+        else:
+            approximate.append((sum(scores) / len(scores), primary_matches,
+                                dict(offer, search_approximate=True)))
+    approximate.sort(key=lambda item: (-item[0], -item[1]))
+    return [offer for _, _, offer in approximate]
+
+
 def select_offers(offers, query='', mode='Alla erbjudanden', expiry='Alla slutdatum',
                   order='Willys ordning', today=None):
     today = today or dt.datetime.now(STOCKHOLM).date()
-    terms = search_key(query).split()
     selected = []
     for offer in offers:
         end = dt.date.fromisoformat(offer['end'])
@@ -1034,9 +1153,9 @@ def select_offers(offers, query='', mode='Alla erbjudanden', expiry='Alla slutda
             continue
         if expiry == 'Inom 3 dagar' and days > 3:
             continue
-        haystack = search_key(' '.join(offer[k] for k in ('name', 'brand', 'description', 'volume')) + ' ' + offer.get('search_extra', ''))
-        if all(term in haystack for term in terms):
-            selected.append(offer)
+        selected.append(offer)
+    if query.strip():
+        selected = search_offers(selected, query)
     if order in ('Störst prissänkning (%)', 'Störst besparing (kr/enhet)'):
         metric = 'discount_percent' if order == 'Störst prissänkning (%)' else 'saving'
         selected.sort(key=lambda o: (o.get(metric) is None, -(o.get(metric) or 0), search_key(o['name'])))
@@ -1054,6 +1173,8 @@ def card(offer, today=None):
     membership = '<span class="badge plus">' + escape(offer.get('member_label', 'Willys Plus')) + '</span>' if offer['member'] else '<span class="badge general">Alla kunder</span>'
     if offer['eligibility'] not in ('LOYALTY', 'GENERAL'):
         membership = '<span class="badge">' + escape(offer['eligibility'] or 'Se villkor') + '</span>'
+    if offer.get('search_approximate'):
+        membership += '<span class="badge">Liknande träff</span>'
     discount = offer.get('discount_percent')
     saving = offer.get('saving')
     saving_label = ''
@@ -1293,6 +1414,7 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
 </form>
 <div id="status" class="notice" role="status" aria-live="polite" hidden></div>
 <p id="note" class="caption" hidden></p><p id="sort-note" class="caption" hidden>Besparing beräknas mot butikens visade jämförelsepris, per prisenhet. Sorter kan skilja sig. Saknas jämförbara priser visas varan sist.</p>
+<p id="search-note" class="caption" role="status" hidden></p>
 <div class="results-bar"><strong id="results-count" aria-live="polite">Hämtar erbjudanden…</strong><span id="freshness"></span></div>
 <div id="grid" class="offer-grid" aria-busy="true"></div>
 <div id="empty" class="empty" hidden><strong>Inga matchningar just nu</strong><p>Prova ett annat sökord eller återställ filtren.</p></div>
@@ -1313,7 +1435,7 @@ function themeButton(){const dark=document.documentElement.dataset.theme==='dark
 function saveUrl(){const url=new URL(location.href);url.searchParams.set('store',$('store').value);url.searchParams.set('theme',document.documentElement.dataset.theme);history.replaceState(null,'',url)}
 $('theme').addEventListener('click',()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;try{localStorage.setItem('foodsale-theme',theme)}catch{}themeButton();saveUrl()});themeButton();
 function notice(text,kind='info'){$('status').textContent=text;$('status').className='notice '+kind;$('status').hidden=!text}
-function clearCards(){ $('grid').replaceChildren();$('total').textContent='—';$('members').textContent='—';$('ending').textContent='—';$('more').hidden=true;$('all').hidden=true;$('page-note').textContent='';$('results-count').textContent='';$('freshness').textContent='';$('empty').hidden=true;fetchedAt=null }
+function clearCards(){ $('grid').replaceChildren();$('total').textContent='—';$('members').textContent='—';$('ending').textContent='—';$('more').hidden=true;$('all').hidden=true;$('page-note').textContent='';$('results-count').textContent='';$('search-note').hidden=true;$('search-note').textContent='';$('freshness').textContent='';$('empty').hidden=true;fetchedAt=null }
 function loading(){if(!$('grid').children.length){$('grid').innerHTML=Array.from({length:6},()=>'<div class="skeleton" aria-hidden="true"><div></div><span></span><span></span></div>').join('')} $('grid').setAttribute('aria-busy','true')}
 function storeDetails(){const config=catalogue[$('store').value];$('store-name').textContent=config.name;$('address').textContent=config.address;for(const id of ['source','official-source'])$(id).href=config.source;const external=config.provider==='official';$('official').hidden=!external;$('summary').hidden=external;$('filters').hidden=external;if(external){$('note').hidden=true;$('sort-note').hidden=true}return external}
 function schedule(seconds){clearTimeout(poll);poll=setTimeout(()=>{if(document.visibilityState==='visible')load();else schedule(60)},seconds*1000)}
@@ -1347,6 +1469,7 @@ async function load(force=false){
   if(!response.ok||data.status!=='ok')throw new Error(data.message||'Erbjudandena kunde inte hämtas. Försök igen om en stund.');
   $('grid').innerHTML=data.cards;if(catalogue[store].provider==='ica'&&data.shown>0)$('store').selectedOptions[0].textContent=catalogue[store].name;$('official').hidden=true;$('summary').hidden=false;$('filters').hidden=false;$('total').textContent=data.total;$('members').textContent=data.members;$('ending').textContent=data.ending;
   $('results-count').textContent=`${data.matches} av ${data.total} erbjudanden`;
+  $('search-note').textContent=data.searchApproximate?`Inga exakta träffar. Visar ${data.matches} liknande träffar.`:'';$('search-note').hidden=!data.searchApproximate;
   fetchedAt=data.fetchedAt;const date=new Date(fetchedAt);$('freshness').textContent='Hämtat '+date.toLocaleString('sv-SE',{timeZone:'Europe/Stockholm',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+' · svensk tid';
   $('note').textContent=data.note||'';$('note').hidden=!data.note;$('sort-note').hidden=!['discount','saving'].includes($('sort').value);
   notice(data.message||'',data.stale||data.refreshFailed?'warning':'info');
@@ -1367,7 +1490,7 @@ document.addEventListener('visibilitychange',()=>{if(document.visibilityState===
 </script>
 </body></html>
 """
-CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-/AkDCmVjFcGS0Zf1wS161tUDre8SNNRrGYh1Rj5DpsY=' 'sha256-LH/hwrSLBoETXNNWSwDuXKFjkizMWVQKoo51hEy9Aw0='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-/AkDCmVjFcGS0Zf1wS161tUDre8SNNRrGYh1Rj5DpsY=' 'sha256-1VzIoRi5WvQ5mCDJoS6VrQ84CNlvqENbJSk0vC8QerM='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 MEMBERSHIP = {'all': 'Alla erbjudanden', 'general': 'Utan medlemskrav', 'member': 'Medlemspriser'}
 EXPIRY = {'all': 'Alla slutdatum', 'today': 'Slutar idag', 'soon': 'Inom 3 dagar'}
@@ -1480,6 +1603,7 @@ def offers_response(store, q, membership, expiry, sort, limit, force=False):
             total=len(current), members=sum(o['member'] for o in current),
             ending=sum(o['end'] == today.isoformat() for o in current),
             matches=len(selected), shown=len(shown), hasMore=len(selected) > len(shown),
+            searchApproximate=any(o.get('search_approximate', False) for o in selected),
             cards=''.join(card(o, today) for o in shown)))
     except (ExtractionUnavailable, urllib.error.URLError, OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
         # Source errors may contain anonymous-client keys. Never return their raw text.

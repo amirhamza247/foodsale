@@ -2,3 +2,4 @@ fastapi==0.163.1
 uvicorn==0.54.0
 tzdata>=2026.1
 playwright==1.65.2
+rapidfuzz==3.14.6
