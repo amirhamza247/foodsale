@@ -20,7 +20,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache, wraps
 from html.parser import HTMLParser
 from typing import Literal
@@ -913,7 +913,13 @@ def normalize_lidl(products, today):
         comparison = require_mapping(price.get('basePrice') or {}, 'Lidl comparison price')
         discount = require_mapping(price.get('discount') or {}, 'Lidl discount')
         volume = plain_text(packaging.get('text'))
-        unit = 'kg' if re.fullmatch(r'(?:per\s*|/)kg', volume.casefold()) else 'prisenhet'
+        direct_unit = re.match(r'^/(kg|l|st|knippe|kruka)(?:\b|$)', clean_text(comparison.get('text')).casefold())
+        unit = (direct_unit[1] if direct_unit and direct_unit[1] in ('kg', 'l') else 'st' if direct_unit else 'prisenhet')
+        if re.fullmatch(r'(?:per\s*|/)kg', volume.casefold()):
+            unit = 'kg'
+        unit_text = plain_text(comparison.get('text'))
+        if direct_unit and direct_unit[1] in ('st', 'knippe', 'kruka') and not volume:
+            volume = '1 st'
         old = price_amount(price.get('oldPrice'))
         saving, percent = None, None
         if (old is not None and old > amount and not price.get('variantsHaveDifferentPrices')
@@ -927,7 +933,8 @@ def normalize_lidl(products, today):
             conditions.append('Priset kan variera mellan sorter.')
         offers.append(dict(name=plain_text(raw.get('fullTitle') or raw.get('title')), brand={12178463: 'OLW'}.get(raw['productId'], ''), volume=volume,
             description=plain_text(facts.get('description')), image=safe_image(raw.get('image') or ''),
-            price=money(amount) + ' kr' + ('/kg' if unit == 'kg' else ''),
+            price=money(amount) + ' kr' + ('/' + unit if unit in ('kg', 'l', 'st') else ''),
+            unit_price_text=unit_text, unit_price_uncertain=bool(price.get('variantsHaveDifferentPrices')),
             ordinary=money(old) + ' kr' if old is not None else '', ordinary_label='Visat referenspris',
             member=plus is not None, member_label='Lidl Plus', eligibility='LOYALTY' if plus is not None else 'GENERAL',
             conditions=list(dict.fromkeys(filter(None, conditions))), start=start.isoformat(), end=end.isoformat(),
@@ -1116,7 +1123,8 @@ def normalize(results, today):
                 name=name, brand=clean_text(product.get('manufacturer')),
                 volume=clean_text(product.get('displayVolume') or promo.get('weightVolume')),
                 description=clean_text(promo.get('description')), image=image,
-                price=price, ordinary=ordinary,
+                price=price, ordinary=ordinary, unit_price_text=clean_text(promo.get('comparePrice')),
+                sale_unit_hint='st' if clean_text(product.get('priceUnit')) == 'kr/st' else '',
                 member=promo.get('campaignType') == 'LOYALTY',
                 eligibility=clean_text(promo.get('campaignType')),
                 conditions=details, start=start.isoformat(), end=end.isoformat(),
@@ -1359,25 +1367,45 @@ def card(offer, today=None):
         membership += '<span class="badge">Liknande träff</span>'
     discount = offer.get('discount_percent')
     saving = offer.get('saving')
-    saving_label = ''
+    saving_label = '<p class="ordinary saving">Besparing saknas</p>'
     if discount is not None and discount > 0 and saving is not None:
         membership += f'<span class="badge">−{discount:.0f} %</span>'
         saving_text = f'{saving:.2f}'.replace('.', ',')
-        saving_label = f'<p class="ordinary">Besparing {saving_text} kr/{escape(offer["saving_unit"])}</p>'
+        saving_label = f'<p class="ordinary saving">Besparing {saving_text} kr/{escape(offer["saving_unit"])}</p>'
     image = ('<img loading="lazy" decoding="async" referrerpolicy="no-referrer" src="' + escape(offer['image']) +
              '" alt="' + escape(offer['name']) + '">') if offer['image'] else '<span>Bild saknas</span>'
-    ordinary = '<p class="ordinary">' + escape(offer.get('ordinary_label', 'Ordinarie')) + ' ' + escape(offer['ordinary']) + '</p>' if offer['ordinary'] else ''
+    ordinary = '<p class="ordinary ordinary-price">' + escape(offer.get('ordinary_label', 'Ordinarie')) + ' ' + escape(offer['ordinary']) + '</p>' if offer['ordinary'] else '<p class="ordinary ordinary-price">Ordinarie pris saknas</p>'
+    # The reference price is a separate quote: never reuse the promotion's published unit price.
+    reference = with_unit_price(dict(sale=offer.get('ordinary', ''), saleUnitHint=offer.get('sale_unit_hint', ''),
+        unitUncertain=offer.get('unit_price_uncertain', False)), offer.get('volume', ''), offer['name'])
+    reference_unit = reference.get('unitPriceDisplay') or reference.get('unitRangeDisplay')
+    reference_label = offer.get('ordinary_label', 'Ordinarie')
+    ordinary += '<p class="ordinary ordinary-unit">' + escape(reference_label + ' ' + reference_unit if reference_unit else reference_label + ' jämförpris saknas') + '</p>'
     conditions = ''.join('<div>' + escape(v) + '</div>' for v in offer['conditions'])
     variants = offer.get('variants', [])
     if variants:
         conditions += '<details><summary>Visa ' + str(len(variants)) + ' sorter</summary>' + ''.join(
             '<div>' + escape(v) + '</div>' for v in variants) + '</details>'
     brand = ' · '.join(filter(None, [offer['brand'], offer['volume']]))
+    quote = offer_unit_quote(offer)
+    unit_label = quote.get('unitPriceDisplay') or quote.get('unitRangeDisplay') or 'Jämförpris saknas'
+    unit_kind = 'known' if quote.get('unitPrice') or quote.get('unitRangeDisplay') else 'missing'
+    unit_terms = ' · '.join(quote.get('priceTerms', []))
+    explanation = [quote.get('unitBasis'), quote.get('unitMessage'), 'Butikspris: ' + offer['price']]
+    if offer.get('volume'):
+        explanation.append('Mängduppgift: ' + offer['volume'])
+    if offer.get('unit_price_text'):
+        explanation.append('Butikens jämförpris: ' + offer['unit_price_text'])
+    unit_details = ''.join('<p>' + escape(v) + '</p>' for v in explanation if v)
+    unit_html = ('<details class="card-unit" data-unit-status="' + escape(quote['unitStatus']) + '"><summary class="unit-' + unit_kind + '" aria-label="Jämförpris: ' + escape(unit_label) + '">' +
+                 '<strong>' + escape(unit_label) + '</strong></summary><div class="unit-explanation">' + unit_details + '</div></details>')
+    if unit_terms:
+        unit_html += '<p class="unit-terms">' + escape(unit_terms) + '</p>'
     dates = (display_date(offer['start']) + ' – ' + display_date(offer['end'])) if offer.get('start') else ('Gäller till ' + display_date(offer['end']))
     return f'''<article class="offer-card" data-offer="{offer_key(offer)}"><div class="offer-turn"><div class="offer-front"><div class="badges">{membership}{urgency}</div>
 <button type="button" class="offer-picture" data-compare-open aria-expanded="false" aria-label="Jämför {escape(offer['name'])} i Halmstad">{image}<span class="compare-affordance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 8h14l-4-4M20 16H6l4 4"/><path d="M18 8a7 7 0 0 1 1 8M6 16a7 7 0 0 1-1-8"/></svg>Jämför priser</span></button><div class="offer-brand">{escape(brand)}</div>
 <h2>{escape(offer['name'])}</h2><p class="offer-description">{escape(offer['description'])}</p>
-<div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{ordinary}{saving_label}</div>
+<div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{unit_html}{ordinary}{saving_label}</div>
 <div class="conditions">{conditions}</div><div class="offer-dates">{dates}</div></div><section class="offer-back" aria-label="Prisjämförelse" aria-hidden="true" inert><header class="compare-header"><div><h3>Jämför i Halmstad</h3><p class="compare-product">{escape(offer['name'])}</p></div><button type="button" class="compare-close quiet" data-compare-close aria-label="Tillbaka till produkten"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg></button></header><div class="compare-state"></div></section></div></article>'''
 
 
@@ -1518,8 +1546,8 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
 .offer-description { margin: 0 0 var(--space-4); font-size: .8125rem; line-height: 1.6; color: var(--viewer-muted); overflow-wrap: anywhere; }
 .offer-description:empty { display: none; }
 .price-block { margin-top: auto; }
-.offer-price { font-size: 1.75rem; line-height: 1.25; font-weight: 750; letter-spacing: -.025em; color: var(--viewer-accent); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.ordinary { margin: 6px 0 var(--space-3); font-size: .75rem; line-height: 1.6; color: var(--viewer-muted); }
+.offer-price { margin: 0; color: var(--viewer-accent); font-size: 1.875rem; line-height: 1.2; font-weight: 750; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ordinary { margin: 2px 0; font-size: .75rem; line-height: 1.6; color: var(--viewer-muted); }
 .conditions { font-size: .75rem; line-height: 1.7; color: var(--viewer-muted); overflow-wrap: anywhere; }
 .conditions summary { display: list-item; min-height: 44px; padding: 11px 0; cursor: pointer; color: var(--viewer-accent); }
 .conditions details[open] summary { padding-bottom: 6px; }
@@ -1566,7 +1594,7 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
   .offer-picture { height: 130px; padding: 6px; margin: var(--space-3) 0; }
   .offer-picture img { max-height: 118px; }
   .offer-card h2 { font-size: 1rem; }
-  .offer-price { font-size: 1.5rem; }
+  .offer-price { font-size: 1.625rem; }
 }
 @media (max-width: 359px) {
   .offer-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1587,6 +1615,18 @@ button.offer-picture { position: relative; width: 100%; border: 0; cursor: point
 button.offer-picture:hover { background: #f4f3ef; }
 .compare-affordance { position: absolute; right: 6px; bottom: 6px; display: inline-flex; gap: 6px; align-items: center; min-height: 32px; padding: 4px 8px; border-radius: 6px; background: white; color: #292923; font-size: .75rem; line-height: 1.2; }
 .compare-affordance svg { width: 16px; height: 16px; }
+
+.card-unit { margin: 0 0 10px; }
+.ordinary-price { margin-top: 12px; }
+.saving { margin-top: 10px; font-weight: 650; color: var(--viewer-text); }
+.card-unit summary { display: flex; align-items: center; min-height: 44px; cursor: pointer; list-style: none; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 5px; }
+.card-unit summary::-webkit-details-marker { display: none; }
+.card-unit strong { font-size: .9375rem; line-height: 1.3; font-weight: 750; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.card-unit .unit-missing strong { font-size: .875rem; font-weight: 600; color: var(--viewer-muted); }
+.unit-terms, .unit-explanation { font-size: .75rem; line-height: 1.45; color: var(--viewer-muted); overflow-wrap: anywhere; }
+.unit-terms { margin: 3px 0 0; }
+.unit-explanation p { margin: 6px 0; }
+
 .compare-header { display: grid; grid-template-columns: minmax(0,1fr) 44px; gap: 8px; align-items: start; padding: 16px 12px 8px 16px; border-bottom: 1px solid var(--viewer-border); }
 .compare-header h3 { margin: 0 0 4px; font-size: 1rem; line-height: 1.35; overflow-wrap: anywhere; }
 .compare-product { margin: 0; font-size: .75rem; line-height: 1.4; color: var(--viewer-muted); overflow-wrap: anywhere; }
@@ -1756,13 +1796,14 @@ function comparisonRender(card,data){
   const item=el('li',undefined,'compare-row');item.dataset.selected=String(row.store===data.selected);item.dataset.store=row.store;
   const title=el('div',undefined,'compare-store'),link=el('a',row.name);try{const url=new URL(row.source);if(url.protocol==='https:'){link.href=url.href;link.target='_blank';link.rel='noopener noreferrer'}}catch{}title.append(link);if(row.store===data.selected)title.append(el('span','Vald butik','compare-selected'));item.append(title);
   const value=el('details',undefined,'compare-value');value.dataset.store=row.store;value.open=opened.has(row.store);const summary=el('summary');value.append(summary);
-  if(row.status==='price'&&row.unitPrice){
+  if(row.status==='price'&&(row.unitPrice||row.unitRangeDisplay)){
    const unitLabel={kg:'kilo',l:'liter',st:'styck'}[row.unit]||row.unit;
-   summary.append(el('strong',new Intl.NumberFormat('sv-SE',{minimumFractionDigits:2,maximumFractionDigits:2}).format(row.unitAmount)+' kr/'+unitLabel));
+   summary.append(el('strong',row.unitPriceDisplay||row.unitRangeDisplay||row.unitPrice.replace(/kr\/(kg|l|st)$/,(_,u)=>'kr/'+({kg:'kilo',l:'liter',st:'styck'}[u]))));
+   if(row.unitRangeDisplay)summary.append(el('span','Varierar med storlek','compare-terms'));
    if(row.priceTerms?.length)summary.append(el('span',row.priceTerms.join(' · '),'compare-terms'));
    summary.setAttribute('aria-label','Prisuppgifter för '+row.name+': '+summary.textContent);
-   const extra=el('div',undefined,'compare-extra');for(const text of [row.matchedProduct,row.packSize,row.scope,row.message,row.fetchedAt?'Hämtat '+new Date(row.fetchedAt).toLocaleString('sv-SE',{timeZone:'Europe/Stockholm'}):null,...(row.conditions||[])].filter(Boolean))extra.append(el('p',text));value.append(extra);
-  }else{summary.append(el('span',row.status==='loading'?'Hämtar…':'Pris saknas','compare-missing'));summary.setAttribute('aria-label','Prisstatus för '+row.name);value.append(el('p',row.message||(row.status==='loading'?'Kontrollerar butikens aktuella pris…':'Priset kunde inte verifieras.'),'compare-extra'))}
+   const extra=el('div',undefined,'compare-extra');for(const text of [row.matchedProduct,row.packSize,row.scope,row.unitBasis,row.unitMessage,row.message,row.fetchedAt?'Hämtat '+new Date(row.fetchedAt).toLocaleString('sv-SE',{timeZone:'Europe/Stockholm'}):null,...(row.conditions||[])].filter(Boolean))extra.append(el('p',text));value.append(extra);
+  }else{summary.append(el('span',row.status==='loading'?'Hämtar…':'Pris saknas','compare-missing'));summary.setAttribute('aria-label','Prisstatus för '+row.name);value.append(el('p',row.unitMessage||row.message||(row.status==='loading'?'Kontrollerar butikens aktuella pris…':'Priset kunde inte verifieras.'),'compare-extra'))}
   item.append(value);
   list.append(item)
  }
@@ -1790,7 +1831,7 @@ document.addEventListener('visibilitychange',()=>{if(document.visibilityState===
 </script>
 </body></html>
 """
-CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-C8FywE6pgTQWkw7XVLvcSGV3dZBz9kKfttVfcQN1jAc=' 'sha256-VlgiN669V/5/fWzQrnCRyauA9YYDal4JwiLNRP5ras8='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+CSP = "default-src 'self'; script-src 'self' 'sha256-FVh2dXczo5qLXZusltiw0aujMjmhcULRFOnWz+qlwkY=' 'sha256-C8FywE6pgTQWkw7XVLvcSGV3dZBz9kKfttVfcQN1jAc=' 'sha256-SL8theBMk80cvcQJ3Ag8peJgyUnFU1YLWZqDS56l9sw='; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 MEMBERSHIP = {'all': 'Alla erbjudanden', 'general': 'Utan medlemskrav', 'member': 'Medlemspriser'}
 EXPIRY = {'all': 'Alla slutdatum', 'today': 'Slutar idag', 'soon': 'Inom 3 dagar'}
@@ -2083,7 +2124,7 @@ def comparison_offer_row(store, offer, fetched, ambiguous=False):
                 percent=None if ambiguous else offer.get('discount_percent'), member=offer.get('member', False),
                 memberLabel=offer.get('member_label', STORES[store].get('member', 'Medlemspris')),
                 conditions=offer.get('conditions', []), scope='Webberbjudande' if store == 'citygross' else 'Butikserbjudande',
-                fetchedAt=fetched, end=offer.get('end'), observed=offer.get('observed'), unitPriceText=offer.get('unit_price_text', ''), eligibility=offer.get('eligibility', ''), message='Ordinarie pris saknas för exakt vald sort.' if ambiguous else '')
+                fetchedAt=fetched, end=offer.get('end'), observed=offer.get('observed'), unitPriceText=offer.get('unit_price_text', ''), unitUncertain=offer.get('unit_price_uncertain', False), saleUnitHint=offer.get('sale_unit_hint', ''), unitSourceGrouped=ambiguous, unitSourceVolume=offer.get('volume', ''), eligibility=offer.get('eligibility', ''), message='Ordinarie pris saknas för exakt vald sort.' if ambiguous else '')
 
 
 def product_price_row(store, product, fetched):
@@ -2279,15 +2320,17 @@ def browser_catalogue_price(store, gtin):
                 continue
             # A per-item price must be explicit; do not turn comparison/kg prices into pack prices.
             spec = offer.get('priceSpecification')
-            if amount is not None and isinstance(spec, dict) and spec.get('unitCode') in ('C62', 'H87'):
-                prices.append((amount, end))
+            if amount is not None and isinstance(spec, dict) and spec.get('unitCode') in ('C62', 'H87', 'KGM', 'LTR'):
+                unit = {'C62': 'st', 'H87': 'st', 'KGM': 'kg', 'LTR': 'l'}[spec['unitCode']]
+                volume = plain_text(node.get('size')) or label_pack_size(plain_text(node.get('name')))
+                prices.append((amount, end, unit, volume, plain_text(node.get('name'))))
     if len(set(prices)) != 1:
         return None
-    amount, end = prices[0]
-    return dict(store=store, name=config['name'], source=url, status='price', ordinary='',
-                sale=money(amount) + ' kr/st', percent=None, member=False, memberLabel='', conditions=[],
+    amount, end, unit, volume, label = prices[0]
+    return with_unit_price(dict(store=store, name=config['name'], source=url, status='price', ordinary='',
+                sale=money(amount) + ' kr/' + unit, percent=None, member=False, memberLabel='', conditions=[],
                 scope='Webbpris', fetchedAt=dt.datetime.now(STOCKHOLM).isoformat(), end=end or None,
-                message='Offentligt webbpris. Ordinarie referenspris och medlemsvillkor saknas.')
+                message='Offentligt webbpris. Ordinarie referenspris och medlemsvillkor saknas.'), volume, label)
 
 
 
@@ -2329,61 +2372,136 @@ def same_product_family(target, name, brand):
     return not remaining
 
 
-def pack_measure(volume):
-    text = search_key(clean_text(volume)).replace(',', '.').rstrip(' .')
-    if re.search(r'\b(?:ca|cirka)\b|\d\s*[-–/]\s*\d', text):
+# Unit-price arithmetic is decimal-only. Floats are used only when serializing numeric API fields.
+UNIT_ALIASES = {'kg': 'kg', 'kilo': 'kg', 'kilogram': 'kg', 'g': 'g', 'gr': 'g', 'grm': 'g', 'gram': 'g',
+                'l': 'l', 'lit': 'l', 'liter': 'l', 'litre': 'l', 'ml': 'ml', 'cl': 'cl', 'dl': 'dl',
+                'st': 'st', 'styck': 'st', 'stycken': 'st', 'p': 'st', 'pack': 'st'}
+UNIT_WORDS = '|'.join(sorted(UNIT_ALIASES, key=len, reverse=True))
+UNIT_NAMES = {'kg': 'kilo', 'l': 'liter', 'st': 'styck'}
+UNIT_FACTORS = {'kg': (Decimal(1), 'kg'), 'g': (Decimal('.001'), 'kg'),
+                'l': (Decimal(1), 'l'), 'ml': (Decimal('.001'), 'l'), 'cl': (Decimal('.01'), 'l'),
+                'dl': (Decimal('.1'), 'l'), 'st': (Decimal(1), 'st')}
+CENT = Decimal('.01')
+
+
+def quantity_text(value):
+    text = search_key(clean_text(value)).strip().rstrip(' .')
+    return re.sub(r'(?<=\d)([,.])\s+(?=\d)', r'\1', text).replace(',', '.')
+
+
+def uncertain_quantity(text):
+    return bool(re.search(r'(?<![a-z])(?:ca|cirka)\.?\s*(?=\d)|[~≈]|\d\s*[-–/]\s*\d', text))
+
+
+def pack_measure_decimal(volume):
+    text = quantity_text(volume)
+    if text in ('styck', 'st', 'per styck', '1-pack'):
+        return Decimal(1), 'st'
+    if uncertain_quantity(text):
         return None
-    match = re.fullmatch(r'\s*(?:(\d+)\s*[x×]\s*)?(\d+(?:\.\d+)?)\s*(kg|g|gram|ml|cl|dl|l|liter|st|styck|stycken|pack)(?:\s*)', text)
+    # Count/yield notations such as 6p/3l can describe prepared volume, not containers.
+    # Only an explicit multiplication is sufficient for an independent calculation.
+    match = re.fullmatch(r'(?:(\d+)\s*[x×]\s*)?(\d+(?:\.\d+)?)\s*-?\s*(' + UNIT_WORDS + r')', text)
     if not match:
-        match = re.fullmatch(r'\s*(\d+)\s*-\s*pack\s*', text)
-        if match:
-            return float(match[1]), 'st'
         return None
-    count, amount, unit = float(match[1] or 1), float(match[2]), match[3]
-    factor, base = {'kg': (1, 'kg'), 'g': (.001, 'kg'), 'gram': (.001, 'kg'),
-                    'ml': (.001, 'l'), 'cl': (.01, 'l'), 'dl': (.1, 'l'), 'l': (1, 'l'),
-                    'liter': (1, 'l'), 'st': (1, 'st'), 'styck': (1, 'st'), 'stycken': (1, 'st'), 'pack': (1, 'st')}[unit]
-    total = count * amount * factor
-    return (total, base) if 0 < total < 100000 else None
+    count, amount, source_unit = match.groups()
+    unit = UNIT_ALIASES[source_unit]
+    factor, base = UNIT_FACTORS[unit]
+    total = Decimal(count or '1') * Decimal(amount) * factor
+    return (total, base) if Decimal(0) < total < Decimal(100000) else None
+
+
+def pack_measure(volume):
+    result = pack_measure_decimal(volume)
+    return (float(result[0]), result[1]) if result else None
 
 
 def label_pack_size(label):
-    if re.search(r'\b(?:ca|cirka)\b|\d\s*[-–/]\s*\d', search_key(label)):
+    text = quantity_text(label)
+    if uncertain_quantity(text):
         return ''
-    pattern = r'(?<![\d.,])(?:\d+\s*[x×]\s*)?\d+(?:[.,]\d+)?\s*(?:kg|gram|g|ml|cl|dl|liter|l|stycken|styck|st)(?![a-z])'
-    sizes = re.findall(pattern, search_key(label))
-    return sizes[0] if len(sizes) == 1 and pack_measure(sizes[0]) else ''
+    pattern = r'(?<![\d.,])(?:\d+\s*[x×]\s*)?\d+(?:\.\d+)?\s*-?\s*(?:' + UNIT_WORDS + r')(?![a-z])'
+    sizes = re.findall(pattern, text)
+    return sizes[0] if len(sizes) == 1 and pack_measure_decimal(sizes[0]) else ''
 
 
-def comparable_unit_price(price, volume):
-    text = search_key(clean_text(price))
-    if any(token in text for token in ('fran', '%', ' upp till ', '·')) or '+pant' in text.replace(' ', ''):
-        return None
-    # Reject composite/ranged prices, preserve volume and multibuy requirements.
-    match = re.fullmatch(r'\s*(?:(\d+)\s*(?:st\s*)?for\s*)?(\d+(?:[.,]\d+)?)\s*kr(?:\s*/\s*(kg|l|st))?\s*', text)
+def sale_packet_decimal(price):
+    text = search_key(clean_text(price)).strip()
+    text = re.sub(r'\s*\+\s*pant\s*$', '', text)
+    match = re.fullmatch(r'(?:(\d+)\s*for\s*)?(\d+(?:[.,:]\d{1,2})?)\s*(?:kr|sek)?\s*(?:/\s*(kg|l|liter|st))?', text)
     if not match:
         return None
-    count, amount, unit = int(match[1] or 1), float(match[2].replace(',', '.')), match[3]
-    if count <= 0 or not 0 <= amount < 1000000:
+    count, amount, unit = match.groups()
+    count, amount = Decimal(count or '1'), price_amount(amount)
+    unit = UNIT_ALIASES.get(unit, unit)
+    if amount is None or not 0 <= amount < 1000000 or count <= 0 or (count > 1 and unit):
         return None
+    return amount, count, unit
+
+
+def sale_unit_decimal(price, volume):
+    packet = sale_packet_decimal(price)
+    if not packet:
+        return None
+    amount, count, unit = packet
     if unit in ('kg', 'l'):
-        return (amount, unit) if count == 1 else None
-    size = pack_measure(volume)
+        return amount, unit
+    size = pack_measure_decimal(volume)
     if size:
         return amount / count / size[0], size[1]
-    # Never compare a packet as a single piece when its weight/volume is unknown.
     return None
 
 
-def published_unit_price(value):
-    text = search_key(clean_text(value)).strip().rstrip('.')
-    text = re.sub(r'^(?:erbj?\.?\s*)?(?:jamforpris|jfr[ -]?pris|jmf[ -]?pris)\s*', '', text)
-    match = re.fullmatch(r'(\d{1,3}(?:[ \u00a0]\d{3})*(?:[,:.]\d{1,2})?|\d+(?:[,:.]\d{1,2})?)\s*(?:kr\s*)?/\s*(kg|kilo|l|lit|liter|st|styck)', text)
+def quantity_range_decimal(volume):
+    text = quantity_text(volume)
+    if re.search(r'(?<![a-z])(?:ca|cirka)\.?\s*(?=\d)|[~≈]', text):
+        return None
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*(' + UNIT_WORDS + r')', text)
     if not match:
         return None
-    amount = float(re.sub(r'[ \u00a0]', '', match[1]).replace(':', '.').replace(',', '.'))
-    unit = {'kilo': 'kg', 'lit': 'l', 'liter': 'l', 'styck': 'st'}.get(match[2], match[2])
-    return (amount, unit) if 0 <= amount < 1000000 else None
+    low, high = Decimal(match[1]), Decimal(match[2])
+    factor, unit = UNIT_FACTORS[UNIT_ALIASES[match[3]]]
+    return (low * factor, high * factor, unit) if 0 < low <= high < 100000 else None
+
+
+def sale_unit_range_decimal(price, volume):
+    packet, bounds = sale_packet_decimal(price), quantity_range_decimal(volume)
+    if not packet or not bounds or packet[2] in ('kg', 'l'):
+        return None
+    amount, count, _ = packet
+    low, high, unit = bounds
+    return amount / count / high, amount / count / low, unit
+
+
+def comparable_unit_price(price, volume):
+    result = sale_unit_decimal(price, volume)
+    return (float(result[0]), result[1]) if result else None
+
+
+def published_unit_decimal(value):
+    text = search_key(clean_text(value)).strip().rstrip('.')
+    text = re.sub(r'\s*\+\s*pant\s*$', '', text).strip()
+    text = re.sub(r'^(?:erbj?\.?\s*)?(?:jamforpris|jfr[ -]?pris|jmf[ -]?pris)\s*', '', text)
+    number = r'(?:\d{1,3}(?:[ \u00a0]\d{3})*(?:[,:.]\d{1,2})?|\d+(?:[,:.]\d{1,2})?)'
+    match = re.fullmatch(r'(' + number + r')(?:\s*[-–]\s*(' + number + r'))?\s*(?:kr\s*)?/\s*(kg|kilo|l|lit|liter|st|styck)', text)
+    if not match:
+        return None
+    def amount(part):
+        return price_amount(re.sub(r'[ \u00a0]', '', part))
+    low, high, unit = amount(match[1]), amount(match[2]) if match[2] else None, UNIT_ALIASES[match[3]]
+    if low is None or low < 0 or low >= 1000000 or (high is not None and not low <= high < 1000000):
+        return None
+    return low, high, unit
+
+
+def published_unit_price(value):
+    result = published_unit_decimal(value)
+    return (float(result[0]), result[2]) if result and result[1] is None else None
+
+
+def unit_money(value, grouped=False):
+    rounded = value.quantize(CENT, rounding=ROUND_HALF_UP)
+    return format(rounded, ',.2f').replace(',', '\xa0').replace('.', ',') if grouped else format(rounded, '.2f').replace('.', ',')
 
 
 def unit_price_terms(row):
@@ -2405,18 +2523,88 @@ def unit_price_terms(row):
 
 def with_unit_price(row, volume, product='', match='exact'):
     row = dict(row, packSize=volume, matchedProduct=product, matchKind=match)
-    for key in ('unitAmount', 'unit', 'unitPrice', 'unitDifferencePercent'):
+    for key in ('unitAmount', 'unit', 'unitPrice', 'unitPriceDisplay', 'unitDifferencePercent', 'unitRangeDisplay', 'unitRangeLow', 'unitRangeHigh', 'unitScope'):
         row.pop(key, None)
-    calculated = comparable_unit_price(row.get('sale', ''), volume)
-    published = published_unit_price(row.get('unitPriceText', ''))
-    # When both are known, conflicting dimensions/amounts fail closed instead of picking a convenient value.
-    unit = published or calculated
-    if published and calculated and (published[1] != calculated[1] or abs(published[0] - calculated[0]) > .05):
-        unit = None
-    row['priceTerms'] = unit_price_terms(row)
-    if unit:
-        row.update(unitAmount=round(unit[0], 6), unit=unit[1], unitPrice=money(round(unit[0], 2)) + ' kr/' + unit[1])
+    published = published_unit_decimal(row.get('unitPriceText', ''))
+    effective_volume = volume
+    if quantity_text(volume) in ('styck', 'st') and published and published[2] in ('kg', 'l'):
+        named = label_pack_size(product)
+        named_size = pack_measure_decimal(named)
+        effective_volume = named if named_size and named_size[1] == published[2] else ''
+    price_uncertain = bool(re.search(r'\bfran\b|upp till|%', search_key(row.get('sale', ''))))
+    uncertain = row.get('unitUncertain', False) or price_uncertain
+    calculated = None if uncertain else sale_unit_decimal(row.get('sale', ''), effective_volume)
+    interval = None if uncertain else sale_unit_range_decimal(row.get('sale', ''), effective_volume)
+    purchase_item = False
+    # An explicit retailer styck price is a price per purchase item, not an invented net weight.
+    # Keep it separate from physical-unit quotes; different pack sizes cannot be matched on this basis.
+    if not uncertain and not published and not calculated and not interval:
+        packet = sale_packet_decimal(row.get('sale', ''))
+        quantity_units = {'kg', 'g', 'gr', 'gram', 'hg', 'ml', 'cl', 'dl', 'l', 'liter', 'st', 'styck', 'pack'}
+        quantity_present = any(m[2] in quantity_units for m in SEARCH_MEASURE.finditer(search_key(volume)))
+        if packet and (packet[2] == 'st' or row.get('saleUnitHint') == 'st') and not quantity_present:
+            named = label_pack_size(product)
+            named_size = pack_measure_decimal(named)
+            if named_size and named_size[1] == 'st':
+                calculated = sale_unit_decimal(row.get('sale', ''), named)
+            else:
+                calculated, purchase_item = (packet[0] / packet[1], 'st'), True
+    row.update(priceTerms=unit_price_terms(row), unitStatus='missing',
+               unitMessage='Butiken saknar ett entydigt jämförpris eller en säker mängduppgift.', unitBasis='')
+    if price_uncertain:
+        row['unitMessage'] = 'Erbjudandet saknar ett verifierbart pris för en exakt vara.'
+        return row
+    # A group's example quote is not a reference for a different, explicitly selected pack size.
+    if (published and published[1] is None and row.get('unitSourceGrouped')
+            and quantity_range_decimal(row.get('unitSourceVolume', '')) and pack_measure_decimal(volume)):
+        published = None
+    conflict = False
+    if interval and published:
+        low, high, unit = interval
+        if published[2] != unit:
+            conflict = True
+        elif published[1] is not None:
+            conflict = (low.quantize(CENT, rounding=ROUND_HALF_UP), high.quantize(CENT, rounding=ROUND_HALF_UP)) != published[:2]
+        else:
+            conflict = not low.quantize(CENT, rounding=ROUND_HALF_UP) <= published[0] <= high.quantize(CENT, rounding=ROUND_HALF_UP)
+    elif published and calculated:
+        value = calculated[0].quantize(CENT, rounding=ROUND_HALF_UP)
+        conflict = published[2] != calculated[1] or (not published[0] <= value <= published[1] if published[1] is not None else published[0] != value)
+    if conflict:
+        row.update(unitStatus='conflict', unitMessage='Butikens pris, mängd och jämförpris stämmer inte överens.')
+        return row
+    if interval or (published and published[1] is not None and not calculated):
+        low, high, unit = interval or published
+        row.update(unit=unit, unitStatus='calculated-range' if interval else 'published-range',
+                   unitRangeLow=float(low), unitRangeHigh=float(high),
+                   unitRangeDisplay=unit_money(low, True) + '–' + unit_money(high, True) + ' kr/' + UNIT_NAMES[unit],
+                   unitMessage='Jämförpriset varierar med vald vara eller storlek.',
+                   unitBasis='Beräknat från butikens pris och storleksintervall.' if interval else 'Butikens publicerade intervall.')
+        return row
+    if calculated:
+        amount, unit = calculated
+        packet = sale_packet_decimal(row.get('sale', ''))
+        direct = bool(packet and packet[2] in ('kg', 'l'))
+        row['unitStatus'] = 'cross-checked' if published else 'direct' if direct else 'calculated'
+        row['unitBasis'] = 'Kontrollerat mot butikens jämförpris.' if published else 'Butikens direktpris per ' + UNIT_NAMES[unit] + '.' if direct else 'Beräknat från butikens pris och mängduppgift.'
+    elif published and not uncertain:
+        amount, _, unit = published
+        row['unitStatus'], row['unitBasis'] = 'published', 'Butikens publicerade jämförpris; mängden kan inte kontrolleras separat.'
+    else:
+        return row
+    row['unitScope'] = 'purchase-item' if purchase_item else 'physical-unit'
+    if purchase_item:
+        row['unitStatus'], row['unitBasis'] = 'direct', 'Butikens styckpris per köpenhet. Antal delar eller nettomängd är inte angivet.'
+    row.update(unitAmount=float(amount), unit=unit, unitPrice=unit_money(amount) + ' kr/' + unit,
+               unitPriceDisplay=unit_money(amount, True) + ' kr/' + UNIT_NAMES[unit], unitMessage='')
     return row
+
+
+def offer_unit_quote(offer):
+    return with_unit_price(dict(sale=offer['price'], unitPriceText=offer.get('unit_price_text', ''),
+        unitUncertain=offer.get('unit_price_uncertain', False), saleUnitHint=offer.get('sale_unit_hint', ''), member=offer.get('member', False),
+        conditions=offer.get('conditions', []), eligibility=offer.get('eligibility', '')),
+        offer.get('volume', ''), offer['name'])
 
 
 @cached_metadata(ttl=300, max_entries=256)
@@ -2446,21 +2634,44 @@ def family_catalogue_search(base, name, brand):
             (pack_measure(plain_text(p.get('displayVolume'))) or p.get('priceUnit') in ('kr/kg', 'kr/l') or published_unit_price(clean_text(p.get('comparePrice')) + '/' + clean_text(p.get('comparePriceUnit'))))][:6]
 
 
+def city_family_matches(family, product):
+    name, brand = plain_text(product.get('name')), plain_text(product.get('brand'))
+    if same_product_family(family, name, brand):
+        return True
+    # Retailer titles can omit the type (e.g. Dill&Gräslök, category Chips).
+    # Only a source category that completes the strict token match can supply it.
+    category = plain_text(product.get('category'))
+    return bool(category and same_product_family(family, name + ' ' + category, brand))
+
+
 @cached_metadata(ttl=300, max_entries=128)
 def city_family_search(name, brand):
     if not brand:
         return []
+    target = dict(name=name, brand=brand)
     query = ' '.join([brand] + [w for w in re.findall(r'[^\W\d_]+', name, re.UNICODE) if search_key(w) in family_words(name, brand)])
-    data = require_mapping(public_json('https://www.citygross.se/api/v1/Loop54/search?' +
-           urllib.parse.urlencode(dict(SearchQuery=query, store='3210', skip=0, take=30))), 'catalogue search')
-    products = require_mapping(data.get('searchResults'), 'catalogue products').get('products') or []
-    if not isinstance(products, list):
-        raise ValueError('Produktsökningen har ändrats.')
-    now = dt.datetime.now(STOCKHOLM).isoformat()
-    return [dict(p, _comparisonFetchedAt=now) for p in products if isinstance(p, dict) and
-            str((p.get('productStoreDetails') or {}).get('id')) == '3210' and
-            same_product_family(dict(name=name, brand=brand), plain_text(p.get('name')), plain_text(p.get('brand'))) and
-            valid_gtin(p.get('gtin'))][:6]
+    # Narrow query first; titles with an omitted type may require a bounded brand search.
+    for search in dict.fromkeys((query, brand)):
+        matches = []
+        for offset in range(0, 90, 30):
+            data = require_mapping(public_json('https://www.citygross.se/api/v1/Loop54/search?' +
+                   urllib.parse.urlencode(dict(SearchQuery=search, store='3210', skip=offset, take=30))), 'catalogue search')
+            results = require_mapping(data.get('searchResults'), 'catalogue products')
+            products = results.get('products') or []
+            if not isinstance(products, list) or len(products) > 30:
+                raise ValueError('Produktsökningen har ändrats.')
+            now = dt.datetime.now(STOCKHOLM).isoformat()
+            matches.extend(dict(p, _comparisonFetchedAt=now) for p in products if isinstance(p, dict) and
+                str((p.get('productStoreDetails') or {}).get('id')) == '3210' and
+                p.get('sellable') is True and city_family_matches(target, p) and valid_gtin(p.get('gtin')))
+            if len(matches) >= 6:
+                break
+            total = results.get('totalCount')
+            if len(products) < 30 or (type(total) is int and offset + len(products) >= total):
+                break
+        if matches:
+            return matches[:6]
+    return []
 
 
 @cached_metadata(ttl=300, max_entries=128)
@@ -2527,7 +2738,7 @@ def coop_catalogue_branches():
     return result
 
 
-def coop_catalogue_items(data, family, store, fetched):
+def coop_catalogue_items(data, family, store, fetched, gtin=''):
     results = require_mapping(require_mapping(data, 'Coop catalogue').get('results'), 'Coop catalogue results')
     items, count = results.get('items'), results.get('count')
     if not isinstance(items, list) or type(count) is not int or count < len(items):
@@ -2537,7 +2748,8 @@ def coop_catalogue_items(data, family, store, fetched):
         require_mapping(product, 'Coop product')
         name, brand = plain_text(product.get('name')), plain_text(product.get('manufacturerName'))
         if (product.get('type') != 'Product' or product.get('availableOnline') is not True
-                or not valid_gtin(product.get('ean')) or not same_product_family(family, name, brand)):
+                or not valid_gtin(product.get('ean'))
+                or not (valid_gtin(product.get('ean')) == valid_gtin(gtin) if valid_gtin(gtin) else same_product_family(family, name, brand))):
             continue
         price = require_mapping(product.get('salesPriceData'), 'Coop current price')
         comparison = require_mapping(product.get('comparativePriceData'), 'Coop current comparison price')
@@ -2554,21 +2766,21 @@ def coop_catalogue_items(data, family, store, fetched):
         row = with_unit_price(dict(store=store, name=STORES[store]['name'], source=STORES[store]['source'],
             status='price', sale=sale, ordinary='', percent=None, member=False, memberLabel='', conditions=[],
             unitPriceText=money(unit_amount) + ' kr/' + unit, scope='Webbpris · upphämtning', fetchedAt=fetched,
-            end=None, message=''), plain_text(product.get('packageSizeInformation')), name, 'family')
+            end=None, message=''), plain_text(product.get('packageSizeInformation')), name, 'exact' if valid_gtin(gtin) else 'family')
         if row.get('unitPrice'):
             candidates.append(row)
     return candidates, count, len(items)
 
 
 @cached_metadata(ttl=300, max_entries=128)
-def coop_family_prices(store, name, brand):
+def coop_family_prices(store, name, brand, gtin=''):
     branches = coop_catalogue_branches()
     if store not in branches:
         return []
     access, candidates = coop_access(), []
     words = [w for w in re.findall(r'[^\W\d_]+', name, re.UNICODE) if search_key(w) in family_words(name, brand)]
-    query = ' '.join([brand] + words)
-    if not words or len(query) > 120:
+    query = gtin if valid_gtin(gtin) else ' '.join([brand] + words)
+    if (not valid_gtin(gtin) and (not words or not brand)) or len(query) > 120:
         return []
     count, received, seen = None, 0, set()
     with PRICE_SOURCE_LOCK:
@@ -2606,7 +2818,7 @@ def coop_family_prices(store, name, brand):
             raise ValueError('Coops produktlista är för stor.')
         data = json.loads(payload)
         rows, total, size = coop_catalogue_items(data, dict(name=name, brand=brand), store,
-                                               dt.datetime.now(STOCKHOLM).isoformat())
+                                               dt.datetime.now(STOCKHOLM).isoformat(), gtin)
         for item in data['results']['items']:
             identity = item.get('id')
             if not isinstance(identity, str) or not identity or identity in seen:
@@ -2743,6 +2955,7 @@ class ComparisonService:
             if catalogue and not family['brand']:
                 family.update(name=plain_text(catalogue.get('name')), brand=plain_text(catalogue.get('brand')))
             family['baseUnit'] = job['rows'][store].get('unit', '')
+            family['unitScope'] = job['rows'][store].get('unitScope', '')
             futures = {self.sources.submit(self.family_row, key, gtin, sku, catalogue, family): key
                        for key in STORES if key != store}
             with self.lock:
@@ -2777,18 +2990,46 @@ class ComparisonService:
 
     def selected_unit_row(self, store, row, gtin, sku, catalogue, family):
         current = with_unit_price(row, family.get('volume', ''), family['name'])
-        return current if current.get('unitPrice') else self.family_row(store, gtin, sku, catalogue, family)
+        return current if current.get('unitPrice') or current.get('unitRangeDisplay') else self.family_row(store, gtin, sku, catalogue, family)
 
     def family_row(self, store, gtin, sku, catalogue, family):
+        target = pack_measure(family.get('volume', ''))
+        base_unit = target[1] if target else family.get('baseUnit', '')
+        def comparable_quote(row):
+            return (bool(base_unit) and row.get('unit') == base_unit and row.get('unitPrice')
+                    and row.get('unitScope') != 'purchase-item' and family.get('unitScope') != 'purchase-item')
+        def exact_quantity(row):
+            # Same validated GTIN means the same pack: a selected source's definite net quantity is usable.
+            if (row and valid_gtin(gtin) and row.get('unitScope') == 'purchase-item'
+                    and target and target[1] in ('kg', 'l')):
+                row = with_unit_price(row, family['volume'], family['name'])
+                if row.get('unitPrice'):
+                    row['unitBasis'] += ' Mängd från vald vara med samma streckkod.'
+                    row['quantitySource'] = 'selected-exact-gtin'
+            return row
         exact = None
         try:
-            exact = self.store_row(store, gtin, sku, catalogue, allow_browser=False)
+            exact = exact_quantity(self.store_row(store, gtin, sku, catalogue, allow_browser=False))
             if exact.get('status') == 'price' and exact.get('unitPrice'):
                 return exact
         except Exception:
             pass
         if not family.get('brand'):
-            return exact or self.unavailable(store, 'Varumärket kunde inte bekräftas.')
+            if STORES[store]['provider'] == 'ica' and valid_gtin(gtin):
+                try:
+                    catalogue_row = exact_quantity(browser_catalogue_price(store, gtin))
+                    if catalogue_row and catalogue_row.get('unitPrice'):
+                        return catalogue_row
+                except Exception:
+                    pass
+            if STORES[store]['provider'] == 'coop' and valid_gtin(gtin):
+                try:
+                    rows = coop_family_prices(store, '', '', gtin)
+                    if rows:
+                        return min(rows, key=lambda r: r['unitAmount'])
+                except Exception:
+                    pass
+            return exact or self.unavailable(store, 'Varumärket kunde inte bekräftas; inget verifierat streckkodspris hittades.')
         config, candidates = STORES[store], []
         lookup_failed = False
         try:
@@ -2834,39 +3075,56 @@ class ComparisonService:
                         row = with_unit_price(comparison_offer_row(store, offer, value['fetchedAt']), offer.get('volume', ''), offer['name'], 'exact' if exact_code else 'family')
                         if row.get('unitPrice'):
                             candidates.append(row)
+        except Exception:
+            lookup_failed = True
+        candidates = [r for r in candidates if comparable_quote(r)]
+        try:
             if config['provider'] == 'axfood':
                 products = family_catalogue_search(config['base'], family['name'], family['brand'])
                 if not products and config['base'] == 'https://www.hemkop.se':
                     products = family_catalogue_search('https://www.willys.se', family['name'], family['brand'])
                 for product in products:
-                    code = product.get('code', '')
-                    identity = axfood_identity(config['base'], code)
-                    scoped = axfood_catalogue(store, code, identity['gtin'])
-                    # Confirm metadata again in the branch-scoped response.
-                    if same_product_family(family, plain_text(scoped.get('name')), plain_text(scoped.get('manufacturer'))):
-                        row = with_unit_price(product_price_row(store, scoped, dt.datetime.now(STOCKHOLM).isoformat()),
-                                              plain_text(scoped.get('displayVolume')), plain_text(scoped.get('name')), 'family')
-                        if row.get('unitPrice'):
-                            candidates.append(row)
+                    try:
+                        code = product.get('code', '')
+                        identity = axfood_identity(config['base'], code)
+                        scoped = axfood_catalogue(store, code, identity['gtin'])
+                        # Confirm metadata again in the branch-scoped response.
+                        if same_product_family(family, plain_text(scoped.get('name')), plain_text(scoped.get('manufacturer'))):
+                            row = with_unit_price(product_price_row(store, scoped, dt.datetime.now(STOCKHOLM).isoformat()),
+                                                  plain_text(scoped.get('displayVolume')), plain_text(scoped.get('name')), 'family')
+                            if row.get('unitPrice'):
+                                candidates.append(row)
+                    except Exception:
+                        lookup_failed = True
+                        continue
             elif config['provider'] == 'coop' and not candidates:
-                candidates.extend(coop_family_prices(store, family['name'], family['brand']))
+                if valid_gtin(gtin):
+                    candidates.extend(coop_family_prices(store, '', '', gtin))
+                if not candidates:
+                    candidates.extend(coop_family_prices(store, family['name'], family['brand']))
             elif config['provider'] == 'ica' and not candidates:
+                if valid_gtin(gtin):
+                    row = exact_quantity(browser_catalogue_price(store, gtin))
+                    if row and row.get('unitPrice'):
+                        return row
                 candidates.extend(browser_family_prices(store, family['name'], family['brand']))
             elif store == 'citygross':
                 for product in city_family_search(family['name'], family['brand']):
-                    row = with_unit_price(product_price_row(store, product, product['_comparisonFetchedAt']),
-                                          plain_text(product.get('descriptiveSize')), plain_text(product.get('name')), 'family')
-                    if row.get('unitPrice'):
-                        candidates.append(row)
+                    try:
+                        row = with_unit_price(product_price_row(store, product, product['_comparisonFetchedAt']),
+                                              plain_text(product.get('descriptiveSize')), plain_text(product.get('name')), 'family')
+                        if row.get('unitPrice'):
+                            candidates.append(row)
+                    except Exception:
+                        lookup_failed = True
+                        continue
         except Exception:
             lookup_failed = True
-        target = pack_measure(family.get('volume', ''))
-        base_unit = target[1] if target else family.get('baseUnit', '')
-        comparable = [r for r in candidates if base_unit and r.get('unit') == base_unit]
+        comparable = [r for r in candidates if comparable_quote(r)]
         if comparable:
             comparable.sort(key=lambda r: (r['unitAmount'], r.get('member', False)))
             best = comparable[0]
-            best['message'] = 'Samma varumärke och sort. Förpackningen kan skilja sig.'
+            best['message'] = 'Samma streckkod.' if best.get('matchKind') == 'exact' else 'Samma varumärke och sort. Förpackningen kan skilja sig.'
             if len(comparable) > 1:
                 best['conditions'] = list(best.get('conditions', [])) + ['Även: ' + r.get('packSize', '') + ' · ' + r['sale'] + ' · ' + r['unitPrice'] + (' · ' + r.get('memberLabel', 'Medlemspris') if r.get('member') else '') for r in comparable[1:]]
             return best
@@ -2912,12 +3170,13 @@ class ComparisonService:
         config = STORES[store]
         if config['provider'] == 'official':
             return self.unavailable(store, 'Källan saknar en tillgänglig produktlista.')
-        if config['provider'] == 'lidl':
+        feed_failed = False
+        try:
             value = cached_store_value(store)
             if not value:
-                return self.unavailable(store, 'Källan saknar verifierade streckkoder.')
-        else:
-            value = store_snapshot(store).value
+                value = store_snapshot(store).value
+        except Exception:
+            value, feed_failed = dict(offers=[]), True
         matches, variant_checks = [], 0
         for offer in select_offers(value['offers']):
             meta = offer.get('comparison') or {}
@@ -2964,7 +3223,7 @@ class ComparisonService:
                     return row
             except Exception:
                 return self.unavailable(store, 'Webbpriset kunde inte hämtas. Källan kan neka automatisk åtkomst.')
-        return self.unavailable(store, 'Inget exakt erbjudande hittades. Ordinarie pris är inte tillgängligt.')
+        return self.unavailable(store, 'Erbjudandekällan kunde inte hämtas; inget verifierat webbpris hittades.' if feed_failed else 'Inget exakt erbjudande hittades. Ordinarie pris är inte tillgängligt.')
 
     def close(self):
         self.workers.shutdown(wait=True, cancel_futures=True)
