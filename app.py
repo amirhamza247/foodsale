@@ -1366,46 +1366,73 @@ def card(offer, today=None):
     if offer.get('search_approximate'):
         membership += '<span class="badge">Liknande träff</span>'
     discount = offer.get('discount_percent')
+    if discount is not None and 0 < discount <= 100:
+        label = '−' + f'{discount:.0f}' + ' %' if discount >= 1 else 'Rabatt <1 %'
+        membership += '<span class="badge discount">' + escape(label) + '</span>'
     saving = offer.get('saving')
-    saving_label = '<p class="ordinary saving">Besparing saknas</p>'
+    saving_label = ''
     if discount is not None and discount > 0 and saving is not None:
-        membership += f'<span class="badge">−{discount:.0f} %</span>'
         saving_text = f'{saving:.2f}'.replace('.', ',')
-        saving_label = f'<p class="ordinary saving">Besparing {saving_text} kr/{escape(offer["saving_unit"])}</p>'
+        saving_label = f'<p class="ordinary saving"><strong>Besparing</strong> {saving_text} kr/{escape(offer["saving_unit"])}</p>'
     image = ('<img loading="lazy" decoding="async" referrerpolicy="no-referrer" src="' + escape(offer['image']) +
              '" alt="' + escape(offer['name']) + '">') if offer['image'] else '<span>Bild saknas</span>'
-    ordinary = '<p class="ordinary ordinary-price">' + escape(offer.get('ordinary_label', 'Ordinarie')) + ' ' + escape(offer['ordinary']) + '</p>' if offer['ordinary'] else '<p class="ordinary ordinary-price">Ordinarie pris saknas</p>'
-    # The reference price is a separate quote: never reuse the promotion's published unit price.
+    # Calculate the ordinary quote separately; never reuse the promotion's unit price.
     reference = with_unit_price(dict(sale=offer.get('ordinary', ''), saleUnitHint=offer.get('sale_unit_hint', ''),
         unitUncertain=offer.get('unit_price_uncertain', False)), offer.get('volume', ''), offer['name'])
-    reference_unit = reference.get('unitPriceDisplay') or reference.get('unitRangeDisplay')
-    reference_label = offer.get('ordinary_label', 'Ordinarie')
-    ordinary += '<p class="ordinary ordinary-unit">' + escape(reference_label + ' ' + reference_unit if reference_unit else reference_label + ' jämförpris saknas') + '</p>'
-    conditions = ''.join('<div>' + escape(v) + '</div>' for v in offer['conditions'])
+    def compact_unit(quote):
+        return (quote.get('unitPriceDisplay') or quote.get('unitRangeDisplay') or '').replace('/kilo', '/kg').replace('/liter', '/l').replace('/styck', '/st')
+    reference_label = offer.get('ordinary_label', 'Ordinarie pris')
+    if reference_label == 'Ordinarie':
+        reference_label = 'Ordinarie pris'
+    ordinary = '<p class="ordinary ordinary-price">' + escape(reference_label + ' ' + offer['ordinary']) + '</p>' if offer.get('ordinary') else ''
+    if ordinary:
+        ordinary += '<p class="ordinary ordinary-unit">Jmf-pris ' + escape(compact_unit(reference) or 'saknas') + '</p>'
+    limits, other_conditions, lowest = [], [], []
+    for text in dict.fromkeys(offer['conditions']):
+        key = search_key(text)
+        if re.fullmatch(r'kampanj[.!:]?', key.strip()):
+            continue
+        if re.match(r'^max(?:[ .:]|$)', key):
+            limits.append(text)
+        elif key.startswith('lagsta pris 30 dagar:'):
+            lowest.append('Lägsta 30-dgrspris ' + text.split(':', 1)[1].strip())
+        elif published_unit_decimal(text) or text == offer.get('unit_price_text'):
+            continue  # Already represented by the calculated quote and its source details.
+        elif key == 'medlemspris' and offer.get('member'):
+            continue  # Membership is retained in the card badge.
+        elif text:
+            other_conditions.append(text)
+    conditions = ''.join('<div>' + escape(v) + '</div>' for v in other_conditions)
+    lowest_html = ''.join('<p class="ordinary lowest-price">' + escape(v) + '</p>' for v in lowest)
     variants = offer.get('variants', [])
     if variants:
         conditions += '<details><summary>Visa ' + str(len(variants)) + ' sorter</summary>' + ''.join(
             '<div>' + escape(v) + '</div>' for v in variants) + '</details>'
     brand = ' · '.join(filter(None, [offer['brand'], offer['volume']]))
     quote = offer_unit_quote(offer)
-    unit_label = quote.get('unitPriceDisplay') or quote.get('unitRangeDisplay') or 'Jämförpris saknas'
+    unit_label = compact_unit(quote) or 'saknas'
     unit_kind = 'known' if quote.get('unitPrice') or quote.get('unitRangeDisplay') else 'missing'
-    unit_terms = ' · '.join(quote.get('priceTerms', []))
+    packet = sale_packet_decimal(offer['price'])
+    unit_terms = list(dict.fromkeys(limits + [v for v in quote.get('priceTerms', []) if v != 'Medlemspris' and search_key(v) not in {search_key(c) for c in other_conditions}]))
+    if packet and packet[1] > 1:
+        unit_terms = [v for v in unit_terms if v != 'Vid köp av ' + str(int(packet[1]))]
     explanation = [quote.get('unitBasis'), quote.get('unitMessage'), 'Butikspris: ' + offer['price']]
     if offer.get('volume'):
         explanation.append('Mängduppgift: ' + offer['volume'])
     if offer.get('unit_price_text'):
         explanation.append('Butikens jämförpris: ' + offer['unit_price_text'])
     unit_details = ''.join('<p>' + escape(v) + '</p>' for v in explanation if v)
-    unit_html = ('<details class="card-unit" data-unit-status="' + escape(quote['unitStatus']) + '"><summary class="unit-' + unit_kind + '" aria-label="Jämförpris: ' + escape(unit_label) + '">' +
-                 '<strong>' + escape(unit_label) + '</strong></summary><div class="unit-explanation">' + unit_details + '</div></details>')
-    if unit_terms:
-        unit_html += '<p class="unit-terms">' + escape(unit_terms) + '</p>'
+    unit_html = ('<details class="card-unit" data-unit-status="' + escape(quote['unitStatus']) + '"><summary class="unit-' + unit_kind + '" aria-label="Jämförpris: ' + escape(unit_label + (' • ' + ' • '.join(unit_terms) if unit_terms else '')) + '">' +
+                 'Jmf-pris <strong>' + escape(unit_label) + '</strong>' + ('<span class="inline-terms"> • ' + escape(' • '.join(unit_terms)) + '</span>' if unit_terms else '') + '</summary><div class="unit-explanation">' + unit_details + '</div></details>')
+    multibuy = ''
+    if packet and packet[1] > 1:
+        amount, count, _ = packet
+        multibuy = '<p class="ordinary multibuy-each"><strong>' + escape(unit_money(amount / count, True)) + ' kr/st</strong> vid köp av ' + str(int(count)) + '</p>'
     dates = (display_date(offer['start']) + ' – ' + display_date(offer['end'])) if offer.get('start') else ('Gäller till ' + display_date(offer['end']))
     return f'''<article class="offer-card" data-offer="{offer_key(offer)}"><div class="offer-turn"><div class="offer-front"><div class="badges">{membership}{urgency}</div>
 <button type="button" class="offer-picture" data-compare-open aria-expanded="false" aria-label="Jämför {escape(offer['name'])} i Halmstad">{image}<span class="compare-affordance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 8h14l-4-4M20 16H6l4 4"/><path d="M18 8a7 7 0 0 1 1 8M6 16a7 7 0 0 1-1-8"/></svg>Jämför priser</span></button><div class="offer-brand">{escape(brand)}</div>
-<h2>{escape(offer['name'])}</h2><p class="offer-description">{escape(offer['description'])}</p>
-<div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{unit_html}{ordinary}{saving_label}</div>
+<h2>{escape(offer['name'])}</h2><p class="offer-description">{escape('' if published_unit_decimal(offer['description']) else offer['description'])}</p>
+<div class="price-block"><div class="offer-price">{escape(offer['price'])}</div>{multibuy}{unit_html}{ordinary}{lowest_html}{saving_label}</div>
 <div class="conditions">{conditions}</div><div class="offer-dates">{dates}</div></div><section class="offer-back" aria-label="Prisjämförelse" aria-hidden="true" inert><header class="compare-header"><div><h3>Jämför i Halmstad</h3><p class="compare-product">{escape(offer['name'])}</p></div><button type="button" class="compare-close quiet" data-compare-close aria-label="Tillbaka till produkten"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg></button></header><div class="compare-state"></div></section></div></article>'''
 
 
@@ -1547,7 +1574,7 @@ input::placeholder { color: var(--viewer-muted); opacity: 1; }
 .offer-description:empty { display: none; }
 .price-block { margin-top: auto; }
 .offer-price { margin: 0; color: var(--viewer-accent); font-size: 1.875rem; line-height: 1.2; font-weight: 750; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.ordinary { margin: 2px 0; font-size: .75rem; line-height: 1.6; color: var(--viewer-muted); }
+.ordinary { margin: 2px 0; font-size: .8125rem; line-height: 1.6; color: var(--viewer-muted); }
 .conditions { font-size: .75rem; line-height: 1.7; color: var(--viewer-muted); overflow-wrap: anywhere; }
 .conditions summary { display: list-item; min-height: 44px; padding: 11px 0; cursor: pointer; color: var(--viewer-accent); }
 .conditions details[open] summary { padding-bottom: 6px; }
@@ -1616,15 +1643,15 @@ button.offer-picture:hover { background: #f4f3ef; }
 .compare-affordance { position: absolute; right: 6px; bottom: 6px; display: inline-flex; gap: 6px; align-items: center; min-height: 32px; padding: 4px 8px; border-radius: 6px; background: white; color: #292923; font-size: .75rem; line-height: 1.2; }
 .compare-affordance svg { width: 16px; height: 16px; }
 
-.card-unit { margin: 0 0 10px; }
-.ordinary-price { margin-top: 12px; }
+.card-unit { margin: 0 0 8px; font-size: .8125rem; color: var(--viewer-muted); }
+.ordinary-price { margin-top: 8px; }
 .saving { margin-top: 10px; font-weight: 650; color: var(--viewer-text); }
-.card-unit summary { display: flex; align-items: center; min-height: 44px; cursor: pointer; list-style: none; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 5px; }
+.card-unit summary { display: block; padding: 10px 0; min-height: 44px; cursor: pointer; list-style: none; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 5px; }
 .card-unit summary::-webkit-details-marker { display: none; }
-.card-unit strong { font-size: .9375rem; line-height: 1.3; font-weight: 750; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.card-unit strong { font-size: inherit; line-height: 1.5; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .card-unit .unit-missing strong { font-size: .875rem; font-weight: 600; color: var(--viewer-muted); }
 .unit-terms, .unit-explanation { font-size: .75rem; line-height: 1.45; color: var(--viewer-muted); overflow-wrap: anywhere; }
-.unit-terms { margin: 3px 0 0; }
+.inline-terms { font-weight: 400; }
 .unit-explanation p { margin: 6px 0; }
 
 .compare-header { display: grid; grid-template-columns: minmax(0,1fr) 44px; gap: 8px; align-items: start; padding: 16px 12px 8px 16px; border-bottom: 1px solid var(--viewer-border); }
@@ -1921,6 +1948,12 @@ async def health():
     return {'status': 'ok'}
 
 
+@app.get('/api/price-index/status')
+async def price_index_status():
+    return dict(mode=price_index.mode, checked=price_index.checked,
+                available=bool(price_index.checked and not price_index.last_error and price_index.mode != 'disabled'))
+
+
 def offers_response(store, q, membership, expiry, sort, limit, force=False):
     config = STORES[store]
     if config['provider'] == 'official':
@@ -2129,6 +2162,9 @@ def comparison_offer_row(store, offer, fetched, ambiguous=False):
 
 def product_price_row(store, product, fetched):
     unit_text = ''
+    locator = dict(provider=STORES[store]['provider'], branch=STORES[store]['id'],
+                   sku=product.get('id' if store == 'citygross' else 'code', ''),
+                   gtin=product.get('gtin' if store == 'citygross' else 'ean', ''))
     fetched = product.get('_comparisonFetchedAt', fetched)
     if store == 'citygross':
         details = require_mapping(product.get('productStoreDetails'), 'catalogue price')
@@ -2138,7 +2174,7 @@ def product_price_row(store, product, fetched):
             copy = dict(product, productStoreDetails=dict(details, p_has_current_week_only_discount=True))
             deals = normalize_citygross([copy], dt.datetime.now(STOCKHOLM).date())
             if deals:
-                return comparison_offer_row(store, deals[0], fetched)
+                return dict(comparison_offer_row(store, deals[0], fetched), catalogueLocator=locator)
         price = require_mapping(prices.get('currentPrice'), 'current price')
         unit = {'PCE': 'st', 'KGM': 'kg', 'LTR': 'l'}.get(price.get('unit'))
         if not unit or price_amount(price.get('price')) is None:
@@ -2160,6 +2196,7 @@ def product_price_row(store, product, fetched):
             if deals:
                 row = comparison_offer_row(store, dict(deals[0], member_label=STORES[store]['member']), fetched)
                 row['scope'] = 'Webberbjudande'
+                row['catalogueLocator'] = locator
                 return row
         label, regular = clean_text(product.get('price')), not promotions
         if price_amount(product.get('priceNoUnit')) is None or product.get('priceUnit') not in ('kr/st', 'kr/kg', 'kr/l'):
@@ -2173,7 +2210,7 @@ def product_price_row(store, product, fetched):
     return dict(store=store, name=STORES[store]['name'], status='price', source=STORES[store]['source'],
                 ordinary=label if regular else '', sale=label, percent=0 if regular else None, member=False,
                 memberLabel='', conditions=[], scope='Ordinarie webbpris' if regular else 'Webbpris', fetchedAt=fetched,
-                end=None, unitPriceText=unit_text, message='' if regular else 'Rabattvillkor kunde inte bekräftas.')
+                end=None, catalogueLocator=locator, unitPriceText=unit_text, message='' if regular else 'Rabattvillkor kunde inte bekräftas.')
 
 
 # Browser fallback is serialized with ICA extraction, never a parallel Chromium per store.
@@ -2222,6 +2259,16 @@ def comparison_robots(base):
     return rules
 
 
+def price_refusal_key(base):
+    return 'refusal:' + hashlib.sha256(base.encode()).hexdigest()
+
+
+def record_price_refusal(base):
+    with PRICE_SOURCE_LOCK:
+        PRICE_SOURCE_COOLDOWNS[base] = time.monotonic() + 3600
+    price_index.put(price_refusal_key(base), dict(until=time.time() + 3600), ttl=3600)
+
+
 def comparison_browser_page(url, base, blocked_api=''):
     """Ordinary anonymous browser; persistent refusals open a host-wide circuit breaker."""
     if not url.startswith(base + '/') or not comparison_robots(base).can_fetch('FoodSale', url):
@@ -2229,6 +2276,12 @@ def comparison_browser_page(url, base, blocked_api=''):
     if not ICA_BROWSER_LOCK.acquire(timeout=30):
         raise ExtractionUnavailable('Produkthämtningen är upptagen.')
     try:
+        stored_refusal = price_index.get(price_refusal_key(base))
+        if stored_refusal and isinstance(stored_refusal.get('until'), (int, float)):
+            remaining = stored_refusal['until'] - time.time()
+            if 0 < remaining <= 3600:
+                with PRICE_SOURCE_LOCK:
+                    PRICE_SOURCE_COOLDOWNS[base] = max(PRICE_SOURCE_COOLDOWNS.get(base, 0), time.monotonic() + remaining)
         with PRICE_SOURCE_LOCK:
             if time.monotonic() < PRICE_SOURCE_COOLDOWNS.get(base, 0):
                 raise ExtractionUnavailable('Källan nekade automatisk prisåtkomst. Försök senare.', 3600)
@@ -2246,8 +2299,7 @@ def comparison_browser_page(url, base, blocked_api=''):
                          (response.url == url or (blocked_api and blocked_api in response.url))) else None)
                 response = page.goto(url, wait_until='domcontentloaded', timeout=20000)
                 if response is not None and response.status in (401, 403, 429):
-                    with PRICE_SOURCE_LOCK:
-                        PRICE_SOURCE_COOLDOWNS[base] = time.monotonic() + 3600
+                    record_price_refusal(base)
                     raise ExtractionUnavailable('Källan nekade automatisk prisåtkomst.', 3600)
                 if response is None or response.status >= 400:
                     raise ValueError('Produktsidan är inte tillgänglig.')
@@ -2257,8 +2309,7 @@ def comparison_browser_page(url, base, blocked_api=''):
                         break
                     page.wait_for_timeout(300)
                 if refused:
-                    with PRICE_SOURCE_LOCK:
-                        PRICE_SOURCE_COOLDOWNS[base] = time.monotonic() + 3600
+                    record_price_refusal(base)
                     raise ExtractionUnavailable('Källan nekade automatisk prisåtkomst.', 3600)
                 final = urllib.parse.urlsplit(page.url)
                 expected = urllib.parse.urlsplit(url)
@@ -2837,8 +2888,198 @@ def coop_family_prices(store, name, brand, gtin=''):
     raise ExtractionUnavailable('För många produktträffar för en säker jämförelse.')
 
 
+# Persistent public product metadata and price snapshots. No visitor/account data is stored.
+class PriceIndex:
+    VERSION = 'unit-v3'
+    LIMIT = 6000
+    MERGE_SCRIPT = """
+local value = cjson.decode(ARGV[1])
+local old = redis.call('GET', KEYS[1])
+if old and ARGV[3] == 'merge' then
+ local previous = cjson.decode(old)
+ for key, entry in pairs(previous) do
+  if not value[key] or entry.observed > value[key].observed then value[key] = entry end
+ end
+end
+redis.call('SET', KEYS[1], cjson.encode(value), 'EX', ARGV[2])
+redis.call('ZADD', KEYS[2], ARGV[4], KEYS[1])
+local extra = redis.call('ZCARD', KEYS[2]) - tonumber(ARGV[5])
+if extra > 0 then
+ local victims = redis.call('ZRANGE', KEYS[2], 0, extra - 1)
+ for _, key in ipairs(victims) do redis.call('DEL', key); redis.call('ZREM', KEYS[2], key) end
+end
+return 1
+"""
+    def __init__(self, path=None, url='', token=''):
+        self.path, self.url, self.token = path, url.rstrip('/'), token
+        self.lock = threading.RLock()
+        self.retry_at = 0
+        self.last_error = ''
+        self.checked = False
+        if url or token:
+            parsed = urllib.parse.urlsplit(url)
+            if (not token or parsed.scheme != 'https' or not (parsed.hostname or '').endswith('.upstash.io')
+                    or parsed.username or parsed.password or parsed.port not in (None, 443)
+                    or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+                raise ValueError('Prisindexets databasadress eller autentisering är ogiltig.')
+
+    @classmethod
+    def configured(cls):
+        url = os.environ.get('UPSTASH_REDIS_REST_URL') or os.environ.get('KV_REST_API_URL', '')
+        token = os.environ.get('UPSTASH_REDIS_REST_TOKEN') or os.environ.get('KV_REST_API_TOKEN', '')
+        if url or token:
+            try:
+                return cls(url=url, token=token)
+            except ValueError:
+                index = cls()
+                index.last_error = 'Databaskonfigurationen är ogiltig.'
+                return index
+        path = os.environ.get('FOODSALE_PRICE_INDEX_PATH')
+        # A local file on Vercel is not durable. Never claim production persistence without a database.
+        if path is None and not (os.environ.get('VERCEL') or os.environ.get('PORT')):
+            from pathlib import Path
+            path = str(Path(__file__).resolve().parent / '.foodsale' / 'price-index.sqlite3')
+        return cls(path=path or None)
+
+    @property
+    def mode(self):
+        return 'shared' if self.url else 'local' if self.path else 'disabled'
+
+    def _key(self, key):
+        return 'foodsale:' + self.VERSION + ':' + key
+
+    def _redis(self, command):
+        request = urllib.request.Request(self.url, data=json.dumps(command, allow_nan=False).encode(), headers={
+            'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
+        with urllib.request.urlopen(request, timeout=3) as response:
+            payload = response.read(1_000_001)
+        if len(payload) > 1_000_000:
+            raise ValueError('Prisindexets svar är för stort.')
+        result = json.loads(payload)
+        if not isinstance(result, dict) or 'error' in result or 'result' not in result:
+            raise ValueError('Prisindexet svarade inte korrekt.')
+        return result['result']
+
+    def _connection(self):
+        import sqlite3
+        from pathlib import Path
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=2)
+        try:
+            connection.execute('CREATE TABLE IF NOT EXISTS price_index (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires REAL NOT NULL, updated REAL NOT NULL)')
+            return connection
+        except Exception:
+            connection.close()
+            raise
+
+    def _failed(self):
+        self.checked = True
+        self.retry_at = time.monotonic() + 30
+        self.last_error = 'Prisindexet är tillfälligt otillgängligt.'
+
+    def get(self, key):
+        if self.mode == 'disabled' or time.monotonic() < self.retry_at:
+            return None
+        try:
+            key = self._key(key)
+            if self.url:
+                raw = self._redis(['GET', key])
+            else:
+                with self.lock:
+                    connection = self._connection()
+                    try:
+                        row = connection.execute('SELECT value FROM price_index WHERE key=? AND expires>?', (key, time.time())).fetchone()
+                        raw = row[0] if row else None
+                    finally:
+                        connection.close()
+            value = json.loads(raw) if raw is not None else None
+            self.last_error = ''
+            self.checked = True
+            return value if isinstance(value, dict) else None
+        except Exception:
+            self._failed()
+            return None
+
+    def put(self, key, value, ttl=86400, merge=False):
+        if self.mode == 'disabled' or time.monotonic() < self.retry_at:
+            return
+        try:
+            key, now = self._key(key), time.time()
+            if len(json.dumps(value, allow_nan=False).encode()) > 250_000:
+                raise ValueError('Prisindexets post är för stor.')
+            if self.url:
+                self._redis(['EVAL', self.MERGE_SCRIPT, 2, key, 'foodsale:' + self.VERSION + ':keys',
+                             json.dumps(value, allow_nan=False), ttl, 'merge' if merge else 'replace', now, self.LIMIT])
+            else:
+                with self.lock:
+                    connection = self._connection()
+                    try:
+                        connection.execute('BEGIN IMMEDIATE')
+                        connection.execute('DELETE FROM price_index WHERE expires<=?', (now,))
+                        if merge:
+                            old = connection.execute('SELECT value FROM price_index WHERE key=?', (key,)).fetchone()
+                            if old:
+                                previous = json.loads(old[0])
+                                value = dict(value)
+                                for store, entry in previous.items():
+                                    if store not in value or entry['observed'] > value[store]['observed']:
+                                        value[store] = entry
+                        connection.execute('INSERT INTO price_index VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires=excluded.expires,updated=excluded.updated',
+                                           (key, json.dumps(value, allow_nan=False), now + ttl, now))
+                        connection.execute('DELETE FROM price_index WHERE key IN (SELECT key FROM price_index ORDER BY updated DESC LIMIT -1 OFFSET ?)', (self.LIMIT,))
+                        connection.commit()
+                    finally:
+                        connection.close()
+            self.last_error = ''
+            self.checked = True
+        except Exception:
+            self._failed()
+
+
+def index_offer_key(store, offer, variant):
+    # Prices can change without changing identity; campaign dates/IDs still bound grouped variant membership.
+    fields = {k: offer.get(k) for k in ('name', 'brand', 'volume', 'start', 'end', 'comparison')}
+    return 'identity:' + hashlib.sha256(json.dumps([store, fields, variant], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def index_product_key(gtin, family):
+    identity = ['gtin', valid_gtin(gtin)] if valid_gtin(gtin) else ['family', comparison_brand(family.get('brand', '')),
+        sorted(family_words(family['name'], family.get('brand', ''))), family.get('volume', ''), family.get('baseUnit', ''), family.get('unitScope', '')]
+    return 'prices:' + hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+
+
+def indexed_context_usable(value):
+    try:
+        family, variants = value['family'], value['variants']
+        return (isinstance(family, dict) and isinstance(family.get('name'), str) and bool(family['name'])
+                and isinstance(family.get('volume', ''), str) and isinstance(family.get('brand', ''), str)
+                and isinstance(variants, list) and 1 <= len(variants) <= 2000
+                and all(isinstance(v, dict) and isinstance(v.get('id'), str) and isinstance(v.get('name'), str) for v in variants)
+                and isinstance(value.get('product'), str) and bool(value['product'])
+                and 0 <= time.time() - value.get('resolvedAt', 0) < 86400
+                and (valid_gtin(value.get('gtin', '')) or family.get('brand')))
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
+def indexed_row_usable(row, now=None, max_age=600):
+    now = now or dt.datetime.now(STOCKHOLM)
+    try:
+        stamp = dt.datetime.fromisoformat(row['fetchedAt'])
+        age = (now - stamp).total_seconds()
+        return (row.get('status') == 'price' and bool(row.get('unitPrice')) and row.get('unitStatus') != 'conflict'
+                and 0 <= age < max_age and (not row.get('end') or row['end'] >= now.date().isoformat())
+                and (not row.get('observed') or row['observed'] == now.date().isoformat()))
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
+price_index = PriceIndex.configured()
+
+
 class ComparisonService:
-    def __init__(self):
+    def __init__(self, index=None):
+        self.index = index
         self.lock = threading.RLock()
         self.jobs = OrderedDict()
         self.workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='comparison')
@@ -2889,7 +3130,7 @@ class ComparisonService:
         if baseline.get('unit'):
             result['rows'][1:] = sorted(result['rows'][1:], key=lambda r: (r.get('unit') != baseline['unit'] or r['status'] != 'price', r.get('unitAmount') if r.get('unitAmount') is not None else float('inf')))
         result['retryAfter'] = max(0, int(30 - (time.monotonic() - job['_created'])) + 1) if job['state'] == 'unavailable' else 0
-        result['completed'] = sum(row['status'] != 'loading' for row in result['rows'])
+        result['completed'] = sum(row['status'] != 'loading' and not row.get('refreshing') for row in result['rows'])
         result['total'] = len(STORES)
         return result
 
@@ -2905,59 +3146,101 @@ class ComparisonService:
         try:
             with self.lock:
                 job['state'] = 'loading'
-            meta = offer.get('comparison') or {}
-            variants = meta.get('variants', [])
-            if meta.get('kind') == 'axfood':
-                variants = axfood_variants(STORES[store]['base'], meta['promotion'])
-            if meta.get('kind') == 'lidl':
-                variants = lidl_product_variants(meta.get('path'), meta.get('product'))
-            if not variants and offer.get('brand'):
-                # The family can still be searched without a source barcode. Candidate identity is not called exact.
-                variants = [dict(id='family', name=offer['name'], gtin='', familyOnly=True)]
-            if not variants:
-                raise ValueError('Produktens varumärke eller streckkod saknas hos källan.')
-            if len(variants) > 1 and not chosen:
+            identity_key = index_offer_key(store, offer, chosen)
+            known = self.index.get(identity_key) if self.index else None
+            if known and indexed_context_usable(known):
+                gtin, sku, catalogue = known.get('gtin', ''), known.get('sku', ''), None
+                family, variants = dict(known['family']), known['variants']
                 with self.lock:
-                    job.update(state='choose', done=True, variants=variants,
-                               message='Välj exakt sort och förpackning för att jämföra samma produkt.')
-                return
-            selected = next((v for v in variants if v['id'] == chosen), None) if chosen else variants[0]
-            if selected is None:
-                raise ValueError('Välj en variant från erbjudandet.')
-            if selected.get('sku') and not selected.get('gtin'):
-                selected = dict(selected, **axfood_identity(STORES[store]['base'], selected['sku']))
-            gtin, sku = selected['gtin'], selected.get('sku', '')
-            if not valid_gtin(gtin) and not selected.get('familyOnly'):
-                raise ValueError('Exakt streckkod kunde inte bekräftas.')
-            with self.lock:
-                job['product'] = selected['name']
-                job['rows'][store]['verified'] = bool(valid_gtin(gtin))
-                job['variants'] = variants
-                job['message'] = 'Samma varumärke och sort. Olika storlekar jämförs per kg, liter eller styck. Medlemskap och mängdköp gäller.'
-                if len(variants) > 1 and (meta.get('kind') != 'axfood' or sku != meta.get('sku')):
-                    row = job['rows'][store]
-                    row.update(ordinary='', percent=None, message='Ordinarie pris saknas för exakt vald sort.')
-            # City Gross's barcode search also supplies the shared Axfood SKU when available.
-            catalogue = None
-            try:
-                catalogue = city_catalogue(gtin, sku)
-                if catalogue:
-                    sku = catalogue['id']
-            except Exception:
-                pass
-            family = dict(name=selected.get('name') or offer['name'], brand=offer.get('brand', ''), volume=offer.get('volume', ''))
-            if len(variants) > 1:
-                family['volume'] = selected.get('volume') or label_pack_size(selected.get('name', '')) or family['volume']
-            if selected.get('brand'):
-                family.update(name=selected.get('name', family['name']), brand=selected['brand'])
-            if selected.get('volume'):
-                family['volume'] = selected['volume']
-            if catalogue and not family['brand']:
-                family.update(name=plain_text(catalogue.get('name')), brand=plain_text(catalogue.get('brand')))
-            family['baseUnit'] = job['rows'][store].get('unit', '')
-            family['unitScope'] = job['rows'][store].get('unitScope', '')
-            futures = {self.sources.submit(self.family_row, key, gtin, sku, catalogue, family): key
-                       for key in STORES if key != store}
+                    job.update(product=known['product'], variants=variants, message='Samma varumärke och sort. Olika storlekar jämförs per kg, liter eller styck. Medlemskap och mängdköp gäller.')
+                    job['rows'][store]['verified'] = bool(valid_gtin(gtin))
+                    if len(variants) > 1:
+                        job['rows'][store].update(ordinary='', percent=None)
+            else:
+                meta = offer.get('comparison') or {}
+                variants = meta.get('variants', [])
+                if meta.get('kind') == 'axfood':
+                    variants = axfood_variants(STORES[store]['base'], meta['promotion'])
+                if meta.get('kind') == 'lidl':
+                    variants = lidl_product_variants(meta.get('path'), meta.get('product'))
+                if not variants and offer.get('brand'):
+                    # The family can still be searched without a source barcode. Candidate identity is not called exact.
+                    variants = [dict(id='family', name=offer['name'], gtin='', familyOnly=True)]
+                if not variants:
+                    raise ValueError('Produktens varumärke eller streckkod saknas hos källan.')
+                if len(variants) > 1 and not chosen:
+                    with self.lock:
+                        job.update(state='choose', done=True, variants=variants,
+                                   message='Välj exakt sort och förpackning för att jämföra samma produkt.')
+                    return
+                selected = next((v for v in variants if v['id'] == chosen), None) if chosen else variants[0]
+                if selected is None:
+                    raise ValueError('Välj en variant från erbjudandet.')
+                if selected.get('sku') and not selected.get('gtin'):
+                    selected = dict(selected, **axfood_identity(STORES[store]['base'], selected['sku']))
+                gtin, sku = selected['gtin'], selected.get('sku', '')
+                if not valid_gtin(gtin) and not selected.get('familyOnly'):
+                    raise ValueError('Exakt streckkod kunde inte bekräftas.')
+                with self.lock:
+                    job['product'] = selected['name']
+                    job['rows'][store]['verified'] = bool(valid_gtin(gtin))
+                    job['variants'] = variants
+                    job['message'] = 'Samma varumärke och sort. Olika storlekar jämförs per kg, liter eller styck. Medlemskap och mängdköp gäller.'
+                    if len(variants) > 1 and (meta.get('kind') != 'axfood' or sku != meta.get('sku')):
+                        row = job['rows'][store]
+                        row.update(ordinary='', percent=None, message='Ordinarie pris saknas för exakt vald sort.')
+                # City Gross's barcode search also supplies the shared Axfood SKU when available.
+                catalogue = None
+                try:
+                    catalogue = city_catalogue(gtin, sku)
+                    if catalogue:
+                        sku = catalogue['id']
+                except Exception:
+                    pass
+                family = dict(name=selected.get('name') or offer['name'], brand=offer.get('brand', ''), volume=offer.get('volume', ''))
+                if len(variants) > 1:
+                    family['volume'] = selected.get('volume') or label_pack_size(selected.get('name', '')) or family['volume']
+                if selected.get('brand'):
+                    family.update(name=selected.get('name', family['name']), brand=selected['brand'])
+                if selected.get('volume'):
+                    family['volume'] = selected['volume']
+                if catalogue and not family['brand']:
+                    family.update(name=plain_text(catalogue.get('name')), brand=plain_text(catalogue.get('brand')))
+                family['baseUnit'] = job['rows'][store].get('unit', '')
+                family['unitScope'] = job['rows'][store].get('unitScope', '')
+                if self.index:
+                    self.index.put(identity_key, dict(gtin=gtin, sku=sku, family=family, variants=variants,
+                        product=job['product'], resolvedAt=time.time()), ttl=86400)
+            price_key = index_product_key(gtin, family)
+            saved = self.index.get(price_key) if self.index else None
+            fresh = set()
+            if saved:
+                with self.lock:
+                    for key in STORES:
+                        entry = saved.get(key)
+                        row = entry.get('row') if isinstance(entry, dict) else None
+                        if key == store or not isinstance(row, dict) or row.get('store') != key:
+                            continue
+                        if row.get('status') == 'unavailable' and isinstance(entry.get('observed'), (int, float)) and 0 <= time.time() - entry['observed'] < 30:
+                            job['rows'][key] = dict(row, indexCached=True)
+                            fresh.add(key)
+                            continue
+                        if not indexed_row_usable(row):
+                            continue
+                        # Re-run arithmetic through the current engine; never trust a stored formatted number.
+                        row = with_unit_price(row, row.get('packSize', ''), row.get('matchedProduct', ''), row.get('matchKind', 'exact'))
+                        if row.get('quantitySource') == 'selected-exact-gtin' and row.get('unitPrice'):
+                            row['unitBasis'] += ' Mängd från vald vara med samma streckkod.'
+                        if not row.get('unitPrice') or (family.get('baseUnit') and row.get('unit') != family['baseUnit']):
+                            continue
+                        row['indexCached'] = True
+                        if indexed_row_usable(row, max_age=300):
+                            fresh.add(key)
+                        else:
+                            row['refreshing'] = True
+                        job['rows'][key] = row
+            futures = {self.sources.submit(self.indexed_family_row, key, gtin, sku, catalogue, family, (saved or {}).get(key)): key
+                       for key in STORES if key != store and key not in fresh}
             with self.lock:
                 selected_row = dict(job['rows'][store])
             futures[self.sources.submit(self.selected_unit_row, store, selected_row, gtin, sku, catalogue, family)] = store
@@ -2969,13 +3252,33 @@ class ComparisonService:
                     except Exception:
                         row = self.unavailable(key, 'Priset kunde inte verifieras just nu.')
                     with self.lock:
+                        previous = job['rows'][key]
+                        if not indexed_row_usable(row) and previous.get('indexCached') and indexed_row_usable(previous):
+                            row = dict(previous, refreshing=False, refreshFailed=True,
+                                       message='Uppdateringen misslyckades. Ett nyligen sparat pris visas.')
+                            row['priceTerms'] = list(row.get('priceTerms', [])) + ['Uppdatering misslyckades']
                         job['rows'][key] = row
             except TimeoutError:
                 for future, key in futures.items():
                     if not future.done():
                         future.cancel()
                         with self.lock:
-                            job['rows'][key] = self.unavailable(key, 'Hämtningen tog för lång tid.')
+                            previous = job['rows'][key]
+                            if previous.get('indexCached') and indexed_row_usable(previous):
+                                job['rows'][key] = dict(previous, refreshing=False, refreshFailed=True,
+                                    message='Uppdateringen tog för lång tid. Ett nyligen sparat pris visas.',
+                                    priceTerms=list(previous.get('priceTerms', [])) + ['Uppdatering misslyckades'])
+                            else:
+                                job['rows'][key] = self.unavailable(key, 'Hämtningen tog för lång tid.')
+            if self.index:
+                with self.lock:
+                    stored = {key: dict(row={k: v for k, v in row.items() if k not in ('indexCached', 'refreshing', 'refreshFailed')},
+                              observed=dt.datetime.fromisoformat(row['fetchedAt']).timestamp())
+                              for key, row in job['rows'].items() if indexed_row_usable(row) and not row.get('indexCached')}
+                    stored.update({key: dict(row=dict(row, status='unavailable'), observed=time.time()) for key, row in job['rows'].items()
+                                   if (row.get('status') == 'unavailable' or row.get('unitStatus') in ('conflict', 'missing')) and not row.get('indexCached')})
+                if stored:
+                    self.index.put(price_key, stored, ttl=604800, merge=True)
             with self.lock:
                 job.update(state='ready', done=True)
         except Exception:
@@ -2987,6 +3290,30 @@ class ComparisonService:
                            message='Källans ursprungliga erbjudande visas. Exakt variant kunde inte identifieras.')
                 job['rows'][store].update(scope='Originalerbjudande · exakt variant ej bekräftad', verified=False,
                                           message='Ingen prisjämförelse har gjorts för detta erbjudande.')
+
+    def indexed_family_row(self, store, gtin, sku, catalogue, family, entry=None):
+        # Old prices stay hidden, but their verified product IDs can avoid another discovery search.
+        locator = (entry.get('row') or {}).get('catalogueLocator') if isinstance(entry, dict) else None
+        if isinstance(locator, dict) and locator.get('provider') == STORES[store]['provider'] and locator.get('branch') == STORES[store]['id'] and valid_gtin(locator.get('gtin', '')):
+            try:
+                if locator['provider'] == 'axfood':
+                    product = axfood_catalogue(store, locator['sku'], locator['gtin'])
+                    matches = (valid_gtin(gtin) == valid_gtin(locator['gtin']) if valid_gtin(gtin) else False) or same_product_family(family, plain_text(product.get('name')), plain_text(product.get('manufacturer')))
+                    volume, name = plain_text(product.get('displayVolume')), plain_text(product.get('name'))
+                elif store == 'citygross':
+                    product = city_catalogue(locator['gtin'], locator['sku'])
+                    matches = product and ((valid_gtin(gtin) == valid_gtin(locator['gtin']) if valid_gtin(gtin) else False) or city_family_matches(family, product))
+                    volume, name = plain_text((product or {}).get('descriptiveSize')), plain_text((product or {}).get('name'))
+                else:
+                    product, matches = None, False
+                if product and matches:
+                    row = with_unit_price(product_price_row(store, product, dt.datetime.now(STOCKHOLM).isoformat()), volume, name,
+                                          'exact' if valid_gtin(gtin) == valid_gtin(locator['gtin']) else 'family')
+                    if indexed_row_usable(row) and (not family.get('baseUnit') or row.get('unit') == family['baseUnit']) and row.get('unitScope') != 'purchase-item':
+                        return row
+            except Exception:
+                pass
+        return self.family_row(store, gtin, sku, catalogue, family)
 
     def selected_unit_row(self, store, row, gtin, sku, catalogue, family):
         current = with_unit_price(row, family.get('volume', ''), family['name'])
@@ -3007,6 +3334,11 @@ class ComparisonService:
                     row['unitBasis'] += ' Mängd från vald vara med samma streckkod.'
                     row['quantitySource'] = 'selected-exact-gtin'
             return row
+        if store == 'citygross' and catalogue is None and valid_gtin(gtin):
+            try:
+                catalogue = city_catalogue(gtin, sku)
+            except Exception:
+                pass
         exact = None
         try:
             exact = exact_quantity(self.store_row(store, gtin, sku, catalogue, allow_browser=False))
@@ -3230,7 +3562,7 @@ class ComparisonService:
         self.sources.shutdown(wait=True, cancel_futures=True)
 
 
-comparison_service = ComparisonService()
+comparison_service = ComparisonService(price_index)
 
 
 @app.post('/api/comparisons')

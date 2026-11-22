@@ -11,13 +11,13 @@ Mode: Operate. Extend the existing Food Sale grid; preserve its warm-neutral/bri
 
 ## Direction contract
 
-THESIS: Each product card leads with the shop’s sale price in large red type, then sale unit price, ordinary price, ordinary unit price and savings. Comparisons retain their trustworthy unit-price focus.
+THESIS: Each product card leads with the shop’s sale price in large red type, then compact Jmf-pris in kr/kg, kr/l or kr/st with purchase limit inline, ordinary price, its Jmf-pris, a source-provided 30-day low if present and bold Besparing. No repeated price or membership lines. Comparisons retain their trustworthy unit-price focus.
 
 OWN-WORLD: Existing warm surfaces, restrained red controls, tabular price numerals and flat divided store rows. No new visual identity or decorative assets.
 
-STORY: Read a prominent unit price on the front card, retaining the original discount price as secondary. The front and back use one Decimal-based engine and one server-rendered display value. Explicit source quantity ranges are shown as ranges, never ranked as exact quotes. Conflicting or incomplete data shows an honest unavailable state. Activate the product image, choose a precise variant where necessary, then read one comparable unit price per store. Remove original/pack prices, discount percentages, difference percentages, and verbose metadata. Keep only short mandatory eligibility markers; metadata remains in keyboard/touch-accessible native details on the unit price. Unavailable is not an absence claim.
+STORY: Read the shop’s prominent offer price followed by its compact unit quote and ordinary-price comparison. The front and back use one Decimal-based engine and one server-rendered display value. Explicit source quantity ranges are shown as ranges, never ranked as exact quotes. Conflicting or incomplete data shows an honest unavailable state. Activate the product image, choose a precise variant where necessary, then read one comparable unit price per store. Remove original/pack prices, discount percentages, difference percentages, and verbose metadata. Keep only short mandatory eligibility markers; metadata remains in keyboard/touch-accessible native details on the unit price. Unavailable is not an absence claim.
 
-FIRST VIEWPORT: Every front card leads with a unit-price value, a labelled range, or Jämförpris saknas; native details explain its source/calculation. Only the activated card rotates. Its back has a product heading, 44px return control, progress status, an independently scrolling price list and a clear retry state. The surrounding grid stays stable.
+FIRST VIEWPORT: Every front card leads with the original offer price followed by Jmf-pris, a labelled range or an explicit unavailable quote; native details explain its source/calculation. Only the activated card rotates. Its back has a product heading, 44px return control, progress status, an independently scrolling price list and a clear retry state. The surrounding grid stays stable.
 
 FORM: seed: none (pinned), “it flips just that card around”. One restrained 3D turn is the signature motion; reduced motion switches instantly. Keyboard focus follows the active face. Lazy requests, shared caches and bounded background workers keep filters responsive.
 

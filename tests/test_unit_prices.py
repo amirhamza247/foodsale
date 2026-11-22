@@ -28,13 +28,53 @@ class UnitPrices(unittest.TestCase):
         item = offer('9,90 kr/st', '500g', '19,80/kg')
         item.update(ordinary='26,97 kr/st', discount_percent=63.29, saving=17.07, saving_unit='st')
         markup = app.card(item, dt.date(2026, 11, 21))
-        labels = ['class="offer-price">9,90 kr/st', '<strong>19,80 kr/kilo', 'Ordinarie 26,97 kr/st',
-                  'Ordinarie 53,94 kr/kilo', 'Besparing 17,07 kr/st']
+        labels = ['class="offer-price">9,90 kr/st', '<strong>19,80 kr/kg', 'Ordinarie pris 26,97 kr/st',
+                  'Jmf-pris 53,94 kr/kg', '<strong>Besparing</strong> 17,07 kr/st']
         positions = [markup.index(label) for label in labels]
         self.assertEqual(positions, sorted(positions))
         missing = app.card(offer('10 kr', ''), dt.date(2026, 11, 21))
         for label in ('Ordinarie pris saknas', 'Ordinarie jämförpris saknas', 'Besparing saknas'):
-            self.assertIn(label, missing)
+            self.assertNotIn(label, missing)
+
+    def test_compact_card_keeps_limits_and_removes_duplicate_prices(self):
+        item = offer('159/kg', '', '159:00 kr/kg')
+        item.update(ordinary='175,00 kr/kg', member=True, discount_percent=9.14, saving=16, saving_unit='kg',
+            conditions=['Max 3 köp', '159:00 kr/kg', 'Medlemspris', 'Lägsta pris 30 dagar: 175,00 kr/kg', 'Välj & blanda!'])
+        markup = app.card(item, dt.date(2026, 11, 21))
+        self.assertIn('159,00 kr/kg</strong><span class="inline-terms"> • Max 3 köp</span>', markup)
+        self.assertIn('aria-label="Jämförpris: 159,00 kr/kg • Max 3 köp"', markup)
+        self.assertEqual(markup.count('Max 3 köp'), 2)  # Visible text and screen-reader name.
+        self.assertNotIn('<div>159:00 kr/kg</div>', markup)
+        self.assertNotIn('<div>Medlemspris</div>', markup)
+        self.assertIn('Lägsta 30-dgrspris 175,00 kr/kg', markup)
+        self.assertIn('Välj &amp; blanda!', markup)
+        self.assertIn('Willys Plus', markup)
+        self.assertIn('Ordinarie pris 175,00 kr/kg', markup)
+        self.assertIn('Jmf-pris 175,00 kr/kg', markup)
+
+    def test_multibuy_shows_conditional_each_price(self):
+        item = offer('2 för 35,00 kr', '400g')
+        markup = app.card(item, dt.date(2026, 11, 21))
+        self.assertIn('<strong>17,50 kr/st</strong> vid köp av 2', markup)
+        self.assertLess(markup.index('class="offer-price"'), markup.index('class="ordinary multibuy-each"'))
+        self.assertLess(markup.index('class="ordinary multibuy-each"'), markup.index('class="card-unit"'))
+        self.assertIn('43,75 kr/kg', markup)
+        for price in ('35,00 kr/st', '2 för 35 kr/st', 'från 2 för 35 kr'):
+            self.assertNotIn('class="ordinary multibuy-each"', app.card(offer(price,'400g'),dt.date(2026,11,21)))
+        markup = app.card(offer('3 för 100 kr +pant','33cl'),dt.date(2026,11,21))
+        self.assertIn('33,33 kr/st</strong> vid köp av 3', markup)
+        self.assertIn('Pant tillkommer', markup)
+
+    def test_campaign_label_removed_and_discount_badge_restored(self):
+        item = offer('10 kr', '500g')
+        item.update(discount_percent=25, saving=3.33, saving_unit='st', conditions=['Kampanj', 'Max 3 köp', 'Gäller ej andra kampanjvaror'])
+        markup = app.card(item, dt.date(2026, 11, 21))
+        self.assertIn('<span class="badge discount">−25 %</span>', markup)
+        self.assertNotIn('<div>Kampanj</div>', markup)
+        self.assertIn('Max 3 köp', markup)
+        self.assertIn('Gäller ej andra kampanjvaror', markup)
+        for discount in (None, 0, -1, 101):
+            self.assertNotIn('badge discount', app.card(dict(item,discount_percent=discount),dt.date(2026,11,21)))
 
     def test_retailer_formats_and_same_value_on_both_faces(self):
         cases = [
@@ -59,7 +99,7 @@ class UnitPrices(unittest.TestCase):
                 self.assertEqual(front['unitPriceDisplay'], expected)
                 self.assertEqual(back['unitPriceDisplay'], expected)
                 markup = app.card(item, dt.date(2026, 11, 21))
-                self.assertIn('<strong>' + html.escape(expected) + '</strong>', markup)
+                self.assertIn('<strong>' + html.escape(expected.replace('/kilo', '/kg').replace('/liter', '/l').replace('/styck', '/st')) + '</strong>', markup)
                 self.assertEqual(item, untouched)
 
     def test_integer_fraction_oracle_for_392_quotes(self):
@@ -96,7 +136,7 @@ class UnitPrices(unittest.TestCase):
             self.assertEqual(q['unitStatus'], 'conflict')
             self.assertNotIn('unitPrice', q)
             item = offer('10 kr', '750g', text)
-            self.assertIn('Jämförpris saknas', app.card(item, dt.date(2026, 11, 21)))
+            self.assertIn('Jmf-pris <strong>saknas', app.card(item, dt.date(2026, 11, 21)))
 
     def test_unknown_approximate_mixed_and_foreign_values_do_not_get_a_number(self):
         for price, volume in [('20 kr', 'ca500g'), ('20 kr', 'ca. 500g'), ('20 kr', '≈500g'),
@@ -114,7 +154,7 @@ class UnitPrices(unittest.TestCase):
         self.assertNotIn('unitAmount', q)
         self.assertNotIn('unitPrice', q)
         item = offer('3 för 48', '125-150g', '106:67-128:00 kr/kg')
-        self.assertIn('106,67–128,00 kr/kilo', app.card(item, dt.date(2026, 11, 21)))
+        self.assertIn('106,67–128,00 kr/kg', app.card(item, dt.date(2026, 11, 21)))
         q = app.with_unit_price(dict(sale='3 för 48', unitPriceText='100-128 kr/kg'), '125-150g')
         self.assertEqual(q['unitStatus'], 'conflict')
         q = app.with_unit_price(dict(sale='3 för 48', unitPriceText='106:67-128:00 kr/kg'), '150g')

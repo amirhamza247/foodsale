@@ -220,3 +220,39 @@ City Gross family search now falls back from a narrow query to a bounded brand q
 A fresh full comparison job for OLW Dill & Gräslök completed all 19 store rows in 19.17 seconds locally. It returned verified unit quotes for City Gross (89.09 kr/kg, buying two), Willys Öster and Flygstaden (94.18 kr/kg), and Stora Coop (96.36 kr/kg). Hemköp's displayed 33.07 kr/275g conflicts with its published 120.26 kr/kg (calculated 120.25), so that quote remains withheld. ICA ordinary-price access was refused by the source; other missing rows remain explicit. Four valid quotes out of 19 rows is **not** full store or product coverage. These are one product and one local run, not a general speed/success guarantee. Peak Python RSS was recorded separately in the local audit; browser-process peak memory and production-host behavior were not measured. No new packages, paid feeds, accounts, deployments or source-access bypasses were introduced.
 
 The permanent offline suite now has 21 tests, including catalogue fallback isolation, exact quantity provenance, wrong-unit offer fallback, source-category matching and retained ICA package/unit fields. Existing source/cache/search/API tests also pass. User preference remains free official sources only.
+
+
+### Compact card price layout
+
+Cards retain the original large red shop offer price, followed by `Jmf-pris` in `kr/kg`, `kr/l` or `kr/st` with purchase limits inline. The ordinary price and its independently calculated `Jmf-pris` follow, then a source-provided 30-day-low price when available, and bold-labelled savings. Missing ordinary prices or savings are omitted; unavailable unit prices remain explicit. Duplicate source comparison-price lines and repeated membership text are removed from visible conditions; membership badges, mix-and-match, deposits and other important restrictions remain. Unit-price provenance stays behind the accessible expandable quote. No price arithmetic or comparison-source changes are part of this presentation update.
+
+Multibuy cards additionally show the calculated price per purchase item directly below the shop total, explicitly conditional on buying the required quantity (for example, `17,50 kr/st vid köp av 2` for `2 för 35,00 kr`). This is not a claim about the price of buying just one. The unit-price line no longer repeats the same minimum-count wording; maximum limits and other terms remain.
+
+The top-of-card discount percentage badge is restored when a validated discount is available. Standalone `Kampanj` labels are hidden; meaningful conditions mentioning campaign exclusions remain intact.
+
+## Persistent comparison index
+
+The app now remembers resolved product identities and branch-specific unit quotes between local restarts. Current quotes younger than five minutes are reused. Quotes between five and ten minutes remain visible with **Sparat pris** while the existing bounded workers refresh them; after ten minutes, expired validity, or a past observation day they are hidden. Failed refreshes retain an otherwise usable recent quote and its original source timestamp. Failed/missing statuses are reused for only 30 seconds and never establish that a product is absent from a store. The selected card's current offer always takes precedence over stored prices.
+
+Identities are stored independently of price, so an updated offer price does not require rediscovering the product. Group/campaign/variant identity remains part of the key. Verified Axfood and City Gross catalogue locators can refresh directly against the same branch and product barcode, falling back to normal discovery if the locator stops working. Old numeric prices are not used just because an old product ID is remembered. Arithmetic is revalidated when a quote is read. Concurrent writes merge store rows atomically and retain the newer source observation. Source refusals are remembered for one hour across restarts when a persistent backend is connected. The index is capped at 6,000 records, with one-day identity and seven-day snapshot retention; the shorter display freshness limits still apply.
+
+### Local use
+
+Run `python app.py` as before. With no hosted environment or shared database configured, SQLite creates `.foodsale/price-index.sqlite3` beside the app. It is runtime data, ignored by Git and not copied into the Docker image. To use a persistent mounted disk on another host, explicitly set `FOODSALE_PRICE_INDEX_PATH` to an absolute writable path. Local database files do not synchronize between machines.
+
+### Vercel: shared database connection required
+
+A local container/function filesystem is not treated as permanent hosting storage. With `VERCEL` or `PORT` set, the local index is disabled unless an explicit persistent path is configured. The app continues using its existing extraction/caches in that case. For a shared index:
+
+1. Open the Food Sale project in Vercel, then **Storage** and create/connect **Upstash Redis** through the Marketplace. Select a free plan if available; check its current limits before confirming.
+2. Connect it to the project's required environments. The integration should provide `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` (the older `KV_REST_API_URL` and `KV_REST_API_TOKEN` names are also supported).
+3. Redeploy. Open a card comparison, then check `/api/price-index/status`: `mode: shared`, `checked: true`, `available: true` confirms a successful index operation in that process. It does not certify grocery-source coverage.
+4. Keep the token server-side, never in frontend code, Git, screenshots or chat. The sample `.env.example` documents the names only; `app.py` does not automatically load `.env` files.
+
+Upstash uses its documented HTTPS Redis REST API through the standard library, so no new runtime package is required. Backend failures have short timeouts and a 30-second cooldown; they degrade to existing live lookups rather than breaking comparisons. The existing `/healthz` response stays unchanged. Missing prices and blocked grocery sources remain unresolved; the index does not create a retailer feed or bypass source restrictions.
+
+### Verification and scope
+
+`python -m unittest discover -s tests -v` now runs 38 tests including disk restarts, preserved source timestamps, freshness/expiry, concurrent merges, bounded storage, direct locator refresh, short negative caching, persistent refusal pauses, REST command contracts and graceful database failure. Existing API/search/cache/source regressions also pass. A single local real-data cold OLW comparison completed 19 store rows in 18.64 seconds, returning four valid quotes. This measures one product and one run, not all-store coverage or page-load time. Separate-process cache reuse and avoided source calls are verified with isolated synthetic fixtures; no live warm-host performance claim is made. Browser-process peak memory was not measured.
+
+The user connected the Free Upstash database `upstash-kv-aquamarine-grass` to `foodsale-mycity`; the Vercel dashboard confirms Available, Free and the connected project. Its displayed configuration names include `KV_REST_API_URL` and `KV_REST_API_TOKEN`, both already supported by the app. Secret values were not revealed. The live `/api/price-index/status` endpoint still returns HTTP404 because the new code remains local and uncommitted. Actual production database operations remain unverified until these changes are pushed and deployed. No paid plan, deployment or scheduled automation was created by the agent. There is no new scheduled full-catalogue crawl: this is a bounded on-demand index that becomes populated as products are compared. A first uncached product still requires source discovery.
