@@ -931,7 +931,7 @@ def normalize_lidl(products, today):
             conditions.append(plain_text(plus.get('lidlPlusText')))
         if price.get('variantsHaveDifferentPrices'):
             conditions.append('Priset kan variera mellan sorter.')
-        offers.append(dict(name=plain_text(raw.get('fullTitle') or raw.get('title')), brand={12178463: 'OLW'}.get(raw['productId'], ''), volume=volume,
+        offers.append(dict(name=plain_text(raw.get('fullTitle') or raw.get('title')), brand=(plain_text((raw.get('brand') or {}).get('name')) if isinstance(raw.get('brand'), dict) else '') or {12178463: 'OLW'}.get(raw['productId'], ''), volume=volume,
             description=plain_text(facts.get('description')), image=safe_image(raw.get('image') or ''),
             price=money(amount) + ' kr' + ('/' + unit if unit in ('kg', 'l', 'st') else ''),
             unit_price_text=unit_text, unit_price_uncertain=bool(price.get('variantsHaveDifferentPrices')),
@@ -2111,10 +2111,10 @@ CATALOGUE_SESSION_LOCKS = {key: threading.Lock() for key, value in STORES.items(
 
 
 @cached_metadata(ttl=300, max_entries=512)
-def axfood_catalogue(store_key, sku, gtin):
+def axfood_catalogue(store_key, sku, gtin, *, family_only=False):
     import http.cookiejar
     config = STORES[store_key]
-    if not valid_gtin(gtin) or not re.fullmatch(r'\d{6,12}_[A-Z]{1,4}', sku):
+    if (not family_only and not valid_gtin(gtin)) or not re.fullmatch(r'\d{6,12}_[A-Z]{1,4}', sku):
         raise ValueError('Ogiltig produktidentitet.')
     with CATALOGUE_SESSION_LOCKS[store_key]:
         state = CATALOGUE_SESSIONS.get(store_key)
@@ -2146,7 +2146,7 @@ def axfood_catalogue(store_key, sku, gtin):
             state = (time.monotonic(), opener)
             CATALOGUE_SESSIONS[store_key] = state
         product = require_mapping(read(state[1], '/axfood/rest/v2/p/' + sku), 'catalogue product')
-        if product.get('code') != sku or valid_gtin(product.get('ean')) != valid_gtin(gtin):
+        if product.get('code') != sku or (not family_only and valid_gtin(product.get('ean')) != valid_gtin(gtin)):
             raise ValueError('Katalogprodukten har en annan streckkod.')
         return dict(product, _comparisonFetchedAt=dt.datetime.now(STOCKHOLM).isoformat())
 
@@ -2322,6 +2322,131 @@ def comparison_browser_page(url, base, blocked_api=''):
         ICA_BROWSER_LOCK.release()
 
 
+def lidl_page_product(markup, product_id):
+    """Read Lidl's server-rendered Nuxt reference table, never JavaScript or arbitrary objects."""
+    records = []
+    for attrs, body in re.findall(r'<script\b([^>]*)>(.*?)</script>', markup, re.I | re.S):
+        if not re.search(r'\bid=["\']__NUXT_DATA__["\']', attrs):
+            continue
+        table = json.loads(body)
+        if not isinstance(table, list) or not 1 <= len(table) <= 30000:
+            raise ValueError('Lidls produktdata har ändrats.')
+        memo, active = {}, set()
+        def expand(index, depth=0):
+            if index == -1:
+                return None  # devalue's undefined marker
+            if type(index) is not int or not 0 <= index < len(table) or depth > 40 or index in active:
+                raise ValueError('Lidls produktdata har ogiltiga referenser.')
+            if index in memo:
+                return memo[index]
+            active.add(index)
+            value = table[index]
+            if isinstance(value, dict):
+                result = {key: expand(ref, depth + 1) for key, ref in value.items()}
+            elif isinstance(value, list):
+                if value and isinstance(value[0], str):
+                    if value[0] not in ('Reactive', 'ShallowReactive', 'Ref', 'ShallowRef') or len(value) != 2:
+                        raise ValueError('Lidls produktdata använder ett okänt format.')
+                    result = expand(value[1], depth + 1)
+                else:
+                    result = [expand(ref, depth + 1) for ref in value]
+            elif value is None or isinstance(value, (str, int, float, bool)):
+                result = value
+            else:
+                raise ValueError('Lidls produktdata använder ett okänt format.')
+            active.remove(index)
+            memo[index] = result
+            return result
+        for index, value in enumerate(table):
+            if isinstance(value, dict) and {'productId', 'regionsPrices', 'storeFacts'} <= value.keys():
+                raw = expand(index)
+                if raw.get('productId') == product_id:
+                    records.append(raw)
+    unique = {json.dumps(v, sort_keys=True): v for v in records}
+    if len(unique) != 1:
+        raise ValueError('Lidls produktsida saknar entydiga butikspriser.')
+    return next(iter(unique.values()))
+
+
+@cached_metadata(ttl=300, max_entries=256)
+def lidl_detail_product(path, product):
+    if type(product) is not int or not isinstance(path, str) or not re.fullmatch(r'/p/[a-z0-9-]+/p' + str(product), path):
+        raise ValueError('Lidls produktadress saknas.')
+    base, url = 'https://www.lidl.se', 'https://www.lidl.se' + path
+    if not comparison_robots(base).can_fetch('FoodSale', url):
+        raise ValueError('Produktsidan tillåter inte hämtning.')
+    markup = read_public(url)
+    raw = lidl_page_product(markup, product)
+    brands = set()
+    for node in public_product_nodes(markup):
+        if str(node.get('sku')) == str(product):
+            brand = node.get('brand')
+            label = plain_text(brand.get('name')) if isinstance(brand, dict) else plain_text(brand)
+            if label:
+                brands.add(label)
+    if len(brands) == 1 and not (isinstance(raw.get('brand'), dict) and raw['brand'].get('name')):
+        raw['brand'] = dict(name=next(iter(brands)))
+    if raw.get('canonicalPath') != path and raw.get('canonicalUrl') != path:
+        raise ValueError('Lidls produktadress stämmer inte med produktinformationen.')
+    return dict(product=raw, fetchedAt=dt.datetime.now(STOCKHOLM).isoformat())
+
+
+def lidl_detail_offers(raw, today):
+    facts = require_mapping(raw.get('storeFacts'), 'Lidl store facts')
+    if facts.get('retail') is not True or facts.get('store') is not True:
+        return []
+    availability = require_mapping(raw.get('stockAvailability'), 'Lidl availability')
+    periods = availability.get('badgeInfoV2')
+    if not isinstance(periods, list):
+        raise ValueError('Lidls produktsida saknar verifierbara butiksdatum.')
+    active = [v for v in periods if isinstance(v, dict) and type(v.get('validFrom')) is int and type(v.get('validUntil')) is int
+              and dt.datetime.fromtimestamp(v['validFrom'], STOCKHOLM).date() <= today <= dt.datetime.fromtimestamp(v['validUntil'], STOCKHOLM).date()]
+    if len(active) != 1:
+        return []
+    start, end = active[0]['validFrom'], active[0]['validUntil']
+    for region in require_mapping(raw.get('regionsV2'), 'Lidl regions').values():
+        if isinstance(region, dict) and clean_text(region.get('regionName')).startswith('Halmstad '):
+            prices = require_mapping(raw.get('regionsPrices'), 'Lidl prices').get(region.get('regionPriceId'))
+            prices = require_mapping(prices, 'Lidl local price')
+            plus = prices.get('currentLidlPlusPrice')
+            price = (plus or {}).get('price') if isinstance(plus, dict) else prices.get('currentPrice')
+            price = require_mapping(price, 'Lidl current local price')
+            for key in ('startDate', 'endDate'):
+                stamp = price.get(key)
+                if stamp:
+                    parsed = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                    stamp = (parsed if parsed.tzinfo else parsed.replace(tzinfo=STOCKHOLM)).timestamp()
+                    if key == 'startDate': start = max(start, int(stamp))
+                    else: end = min(end, int(stamp))
+    # Source availability dates and source price validity must overlap.
+    if start > end:
+        return []
+    prepared = dict(raw, storeStartDate=start, storeEndDate=end,
+                    fullTitle=plain_text((raw.get('keyfacts') or {}).get('fullTitle')), image='')
+    return normalize_lidl([prepared], today)
+
+
+def lidl_detail_quote(store, locator, gtin, family, today=None):
+    # The same three-region price validation as the main feed: never use a national/default quote.
+    value = lidl_detail_product(locator.get('path'), locator.get('product'))
+    raw = value['product']
+    offers = lidl_detail_offers(raw, today or dt.datetime.now(STOCKHOLM).date())
+    if not offers:
+        return None
+    offer = offers[0]
+    codes = raw.get('eans') or []
+    codes = {valid_gtin(v) for v in codes if isinstance(v, str) and valid_gtin(v)} if isinstance(codes, list) else set()
+    exact = bool(valid_gtin(gtin) and valid_gtin(gtin) in codes)
+    if not exact and not same_product_family(family, offer['name'], offer['brand']):
+        return None
+    row = with_unit_price(comparison_offer_row(store, offer, value['fetchedAt']), offer.get('volume', ''), offer['name'], 'exact' if exact else 'family')
+    if row.get('unitPrice') and (not family.get('baseUnit') or row['unit'] == family['baseUnit']):
+        row['source'] = 'https://www.lidl.se' + locator['path']
+        row['catalogueLocator'] = dict(provider='lidl', branch=STORES[store]['address'], path=locator['path'], product=locator['product'], gtin=next(iter(codes)) if len(codes) == 1 else '')
+        return row
+    return None
+
+
 @cached_metadata(ttl=86400, max_entries=256)
 def lidl_product_variants(path, product):
     if not isinstance(path, str) or not re.fullmatch(r'/p/[a-z0-9-]+/p' + str(product), path):
@@ -2330,6 +2455,21 @@ def lidl_product_variants(path, product):
     url = base + path
     if not comparison_robots(base).can_fetch('FoodSale', url):
         raise ValueError('Produktsidan tillåter inte hämtning.')
+    try:
+        detail = lidl_detail_product(path, product)['product']
+    except ValueError:
+        detail = None
+    if detail:
+        codes = detail.get('eans') or []
+        brand = (detail.get('brand') or {}).get('name', '')
+        variants = [dict(compare_variant(code, plain_text((detail.get('keyfacts') or {}).get('fullTitle'))), brand=plain_text(brand))
+                    for code in codes if isinstance(code, str) and valid_gtin(code)] if isinstance(codes, list) else []
+        if variants:
+            with PRICE_SOURCE_LOCK:
+                LIDL_COMPARISON_IDENTITIES[(path, product)] = tuple(v['gtin'] for v in variants)
+                while len(LIDL_COMPARISON_IDENTITIES) > 256:
+                    LIDL_COMPARISON_IDENTITIES.popitem(last=False)
+            return list({v['id']: v for v in variants}.values())
     # Product metadata is normally server-rendered: avoid Chrome unless it is missing.
     markup = read_public(url)
     nodes = [n for n in public_product_nodes(markup) if str(n.get('sku')) == str(product)]
@@ -2390,10 +2530,27 @@ FAMILY_STOP = {'och', 'and', 'maxipack', 'storpack', 'multipack', 'pack', 'forpa
 
 
 def family_words(value, brand=''):
-    value = SEARCH_MEASURE.sub(lambda m: m[0] if m[2] == '%' else ' ', search_key(value))
+    value = search_key(value)
+    # Multipack count is packaging, not a flavour/type modifier. Keep percentages/model numbers.
+    value = re.sub(r'(?<![\w.,])\d+\s*[x×]\s*(?=\d+(?:[.,]\d+)?\s*(?:kg|hg|g|ml|cl|dl|l|st)(?![a-z]))', '', value)
+    value = re.sub(r'(?<![\w.,])\d+\s*[- ]?\s*(?:pack|stycken|styck|st|p)(?![a-z0-9])', ' ', value)
+    value = SEARCH_MEASURE.sub(lambda m: search_number(m[1]) + '%' if m[2] == '%' else ' ', value)
     words = re.findall(r'[^\W\d_]+|\d+(?:[.,]\d+)?%?', value, re.UNICODE)
     brand_words = set(re.findall(r'[^\W\d_]+', search_key(brand), re.UNICODE))
     return set(words) - FAMILY_STOP - brand_words
+
+
+def family_label_from_facts(name, description=''):
+    label = search_key(name)
+    if '%' in label or not re.search(r'\b(?:\w*ost|mjolk|gradde|yoghurt)\b', label):
+        return name
+    text = search_key(plain_text(description))
+    if re.search(r'\d\s*[-–/]\s*\d+(?:[.,]\d+)?\s*%', text):
+        return name
+    percentages = re.findall(r'fetthalt\s*:?\s*(\d+(?:[.,]\d+)?)\s*%', text)
+    percentages += re.findall(r'(\d+(?:[.,]\d+)?)\s*%\s*fetthalt', text)
+    unique = {search_number(v) for v in percentages if Decimal(v.replace(',', '.')) <= 100}
+    return name + ' ' + next(iter(unique)).replace('.', ',') + '%' if len(unique) == 1 else name
 
 
 def comparison_brand(value):
@@ -2621,6 +2778,18 @@ def with_unit_price(row, volume, product='', match='exact'):
     elif published and calculated:
         value = calculated[0].quantize(CENT, rounding=ROUND_HALF_UP)
         conflict = published[2] != calculated[1] or (not published[0] <= value <= published[1] if published[1] is not None else published[0] != value)
+    rounding_difference = False
+    if conflict and calculated and published and published[1] is None and published[2] == calculated[1]:
+        size = pack_measure_decimal(effective_volume)
+        packet = sale_packet_decimal(row.get('sale', ''))
+        if size and packet and packet[2] not in ('kg', 'l'):
+            derived = calculated[0].quantize(CENT, rounding=ROUND_HALF_UP)
+            # Retailers may round a per-pack amount before dividing by net quantity.
+            rounding_bound = CENT / 2 / size[0] + CENT / 2
+            rounding_difference = (abs(derived - published[0]) <= CENT and
+                                   abs(calculated[0] - published[0]) < rounding_bound)
+            if rounding_difference:
+                conflict = False
     if conflict:
         row.update(unitStatus='conflict', unitMessage='Butikens pris, mängd och jämförpris stämmer inte överens.')
         return row
@@ -2643,6 +2812,9 @@ def with_unit_price(row, volume, product='', match='exact'):
         row['unitStatus'], row['unitBasis'] = 'published', 'Butikens publicerade jämförpris; mängden kan inte kontrolleras separat.'
     else:
         return row
+    if rounding_difference:
+        row['unitStatus'] = 'calculated-rounding'
+        row['unitBasis'] = 'Beräknat från visat butikspris och mängd. Butikens jämförpris avviker med ett öre.'
     row['unitScope'] = 'purchase-item' if purchase_item else 'physical-unit'
     if purchase_item:
         row['unitStatus'], row['unitBasis'] = 'direct', 'Butikens styckpris per köpenhet. Antal delar eller nettomängd är inte angivet.'
@@ -2890,7 +3062,7 @@ def coop_family_prices(store, name, brand, gtin=''):
 
 # Persistent public product metadata and price snapshots. No visitor/account data is stored.
 class PriceIndex:
-    VERSION = 'unit-v3'
+    VERSION = 'unit-v4'
     LIMIT = 6000
     MERGE_SCRIPT = """
 local value = cjson.decode(ARGV[1])
@@ -3159,10 +3331,15 @@ class ComparisonService:
             else:
                 meta = offer.get('comparison') or {}
                 variants = meta.get('variants', [])
-                if meta.get('kind') == 'axfood':
-                    variants = axfood_variants(STORES[store]['base'], meta['promotion'])
-                if meta.get('kind') == 'lidl':
-                    variants = lidl_product_variants(meta.get('path'), meta.get('product'))
+                try:
+                    if meta.get('kind') == 'axfood':
+                        variants = axfood_variants(STORES[store]['base'], meta['promotion'])
+                    if meta.get('kind') == 'lidl':
+                        variants = lidl_product_variants(meta.get('path'), meta.get('product'))
+                except Exception:
+                    # Identity-page failure must not suppress a source-confirmed brand/name family lookup.
+                    # This fallback never claims an exact barcode match.
+                    variants = []
                 if not variants and offer.get('brand'):
                     # The family can still be searched without a source barcode. Candidate identity is not called exact.
                     variants = [dict(id='family', name=offer['name'], gtin='', familyOnly=True)]
@@ -3177,7 +3354,13 @@ class ComparisonService:
                 if selected is None:
                     raise ValueError('Välj en variant från erbjudandet.')
                 if selected.get('sku') and not selected.get('gtin'):
-                    selected = dict(selected, **axfood_identity(STORES[store]['base'], selected['sku']))
+                    try:
+                        selected = dict(selected, **axfood_identity(STORES[store]['base'], selected['sku']))
+                    except Exception:
+                        if not offer.get('brand'):
+                            raise
+                        # Variable-weight retailer codes need not be valid consumer barcodes.
+                        selected = dict(selected, gtin='', familyOnly=True)
                 gtin, sku = selected['gtin'], selected.get('sku', '')
                 if not valid_gtin(gtin) and not selected.get('familyOnly'):
                     raise ValueError('Exakt streckkod kunde inte bekräftas.')
@@ -3206,6 +3389,9 @@ class ComparisonService:
                     family['volume'] = selected['volume']
                 if catalogue and not family['brand']:
                     family.update(name=plain_text(catalogue.get('name')), brand=plain_text(catalogue.get('brand')))
+                if meta.get('kind') == 'lidl':
+                    family['lidlLocator'] = dict(path=meta.get('path'), product=meta.get('product'))
+                family['name'] = family_label_from_facts(family['name'], offer.get('description', ''))
                 family['baseUnit'] = job['rows'][store].get('unit', '')
                 family['unitScope'] = job['rows'][store].get('unitScope', '')
                 if self.index:
@@ -3294,7 +3480,15 @@ class ComparisonService:
     def indexed_family_row(self, store, gtin, sku, catalogue, family, entry=None):
         # Old prices stay hidden, but their verified product IDs can avoid another discovery search.
         locator = (entry.get('row') or {}).get('catalogueLocator') if isinstance(entry, dict) else None
-        if isinstance(locator, dict) and locator.get('provider') == STORES[store]['provider'] and locator.get('branch') == STORES[store]['id'] and valid_gtin(locator.get('gtin', '')):
+        if (isinstance(locator, dict) and locator.get('provider') == 'lidl' and STORES[store]['provider'] == 'lidl'
+                and locator.get('branch') == STORES[store]['address']):
+            try:
+                direct = lidl_detail_quote(store, locator, gtin, family)
+                if direct:
+                    return direct
+            except Exception:
+                pass
+        if isinstance(locator, dict) and locator.get('provider') == STORES[store]['provider'] and locator.get('branch') == STORES[store].get('id') and valid_gtin(locator.get('gtin', '')):
             try:
                 if locator['provider'] == 'axfood':
                     product = axfood_catalogue(store, locator['sku'], locator['gtin'])
@@ -3334,6 +3528,13 @@ class ComparisonService:
                     row['unitBasis'] += ' Mängd från vald vara med samma streckkod.'
                     row['quantitySource'] = 'selected-exact-gtin'
             return row
+        if STORES[store]['provider'] == 'lidl' and isinstance(family.get('lidlLocator'), dict):
+            try:
+                direct = lidl_detail_quote(store, family['lidlLocator'], gtin, family)
+                if direct:
+                    return direct
+            except Exception:
+                pass
         if store == 'citygross' and catalogue is None and valid_gtin(gtin):
             try:
                 catalogue = city_catalogue(gtin, sku)
@@ -3369,7 +3570,7 @@ class ComparisonService:
             if not value and config['provider'] != 'official':
                 value = store_snapshot(store).value
             for offer in select_offers(value['offers'] if value else []):
-                if same_product_family(family, offer['name'], offer.get('brand', '')):
+                if same_product_family(family, family_label_from_facts(offer['name'], offer.get('description', '')), offer.get('brand', '')):
                     row = with_unit_price(comparison_offer_row(store, offer, value['fetchedAt']), offer.get('volume', ''), offer['name'], 'family')
                     if row.get('unitPrice'):
                         candidates.append(row)
@@ -3383,7 +3584,7 @@ class ComparisonService:
                     brand = variant.get('brand') or offer.get('brand', '')
                     volume = variant.get('volume') or label_pack_size(label) or offer.get('volume', '')
                     identity = (label, brand, volume)
-                    if identity in seen or not same_product_family(family, label, brand):
+                    if identity in seen or not same_product_family(family, family_label_from_facts(label, offer.get('description', '')), brand):
                         continue
                     seen.add(identity)
                     row = with_unit_price(comparison_offer_row(store, offer, value['fetchedAt'], True), volume, label, 'family')
@@ -3418,8 +3619,7 @@ class ComparisonService:
                 for product in products:
                     try:
                         code = product.get('code', '')
-                        identity = axfood_identity(config['base'], code)
-                        scoped = axfood_catalogue(store, code, identity['gtin'])
+                        scoped = axfood_catalogue(store, code, '', family_only=True)
                         # Confirm metadata again in the branch-scoped response.
                         if same_product_family(family, plain_text(scoped.get('name')), plain_text(scoped.get('manufacturer'))):
                             row = with_unit_price(product_price_row(store, scoped, dt.datetime.now(STOCKHOLM).isoformat()),

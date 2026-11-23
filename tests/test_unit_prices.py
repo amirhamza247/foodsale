@@ -130,13 +130,23 @@ class UnitPrices(unittest.TestCase):
         self.assertEqual(q['unitPriceDisplay'], '1\xa0000,00 kr/kilo')
         self.assertIn("row.unitPriceDisplay||row.unitRangeDisplay", app.PAGE)
 
-    def test_source_conflicts_fail_closed_even_for_one_cent(self):
-        for text in ('13,34/kg', '13,32/kg', '13,33/l'):
+    def test_source_conflicts_beyond_rounding_or_wrong_dimension_fail_closed(self):
+        for text in ('13,35/kg', '13,31/kg', '13,33/l'):
             q = app.with_unit_price(dict(sale='10 kr', unitPriceText=text), '750g')
             self.assertEqual(q['unitStatus'], 'conflict')
             self.assertNotIn('unitPrice', q)
             item = offer('10 kr', '750g', text)
             self.assertIn('Jmf-pris <strong>saknas', app.card(item, dt.date(2026, 11, 21)))
+
+    def test_small_retailer_rounding_uses_calculated_not_published_value(self):
+        q = app.with_unit_price(dict(sale='33,07 kr/st', unitPriceText='120,26 kr/kg'), '275g')
+        self.assertEqual(q['unitPriceDisplay'], '120,25 kr/kilo')
+        self.assertEqual(q['unitStatus'], 'calculated-rounding')
+        self.assertIn('ett öre', q['unitBasis'])
+        self.assertEqual(app.with_unit_price(dict(sale='10 kr',unitPriceText='13,34/kg'),'750g')['unitPriceDisplay'],'13,33 kr/kilo')
+        # Direct per-unit prices have no package-rounding ambiguity.
+        self.assertEqual(app.with_unit_price(dict(sale='10 kr/kg',unitPriceText='10,01/kg'),'')['unitStatus'],'conflict')
+        self.assertEqual(app.with_unit_price(dict(sale='33,07 kr/st',unitPriceText='120,30/kg'),'275g')['unitStatus'],'conflict')
 
     def test_unknown_approximate_mixed_and_foreign_values_do_not_get_a_number(self):
         for price, volume in [('20 kr', 'ca500g'), ('20 kr', 'ca. 500g'), ('20 kr', '≈500g'),

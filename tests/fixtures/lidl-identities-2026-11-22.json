@@ -1,0 +1,213 @@
+[
+  {
+    "storeStartDate": 1794783600,
+    "storeEndDate": 1795388399,
+    "regionsV2": {
+      "1": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": true,
+        "regionName": "Halmstad 1",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "2": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Halmstad 2",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "3": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Halmstad 3",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "4": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Rosersberg 1",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "5": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Rosersberg 2",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "6": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Rosersberg 3",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "7": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Örebro",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      }
+    },
+    "regionsPrices": {
+      "1": {
+        "currentPrice": {
+          "price": 69.9,
+          "hasVat": true,
+          "endDate": "2026-11-22T22:59:59Z",
+          "hasStar": true,
+          "discount": {
+            "showFrom": false,
+            "showUpTo": false,
+            "discountText": "Superpris",
+            "showDiscount": false,
+            "showPercentage": false,
+            "discountHasStar": false,
+            "fromRecommendedPrice": false,
+            "fromNormalPriceForLidlPlus": false
+          },
+          "basePrice": {
+            "text": "/kg (Ca 2,2 kg",
+            "prefix": false
+          },
+          "startDate": "2026-11-03T13:44:21.736Z",
+          "priceTheme": "white_red",
+          "currencyCode": "SEK",
+          "currencySymbol": "kr",
+          "endDateExclusive": "2026-11-22T23:00Z",
+          "variantsHaveDifferentPrices": false
+        }
+      }
+    },
+    "productId": 11217379,
+    "keyfacts": {
+      "title": "Hushållsost",
+      "fullTitle": "Arla Hushållsost",
+      "description": "<ul> <li>Fetthalt: 26%</li> <li>Max 3 f&ouml;rp./hush&aring;ll</li> </ul>",
+      "moreDetails": "Ytterligare detaljer",
+      "analyticsCategory": "Food",
+      "wonCategoryPrimary": "Världar i nöd/Mat och nära mat/Ost, mejeriprodukter och ägg/Ost",
+      "wonCategoryPrimaryPath": "0/17/1739/173912"
+    },
+    "fullTitle": "Arla Hushållsost",
+    "title": "Hushållsost",
+    "image": "https://www.lidl.se/assets/gcp3c9ed46adbeb4c528b12a91ce06047cf.png",
+    "canonicalUrl": "/p/arla-hushaallsost/p11217379",
+    "canonicalPath": "/p/arla-hushaallsost/p11217379",
+    "brand": {
+      "url": "/q/search?q=arla",
+      "name": "Arla",
+      "showBrand": true
+    }
+  },
+  {
+    "storeStartDate": 1794783600,
+    "storeEndDate": 1795993199,
+    "regionsV2": {
+      "1": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": true,
+        "regionName": "Halmstad 1",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "2": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Halmstad 2",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "3": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Halmstad 3",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "4": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Rosersberg 1",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "5": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Rosersberg 2",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "6": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Rosersberg 3",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      },
+      "7": {
+        "hasVat": false,
+        "status": "ONLINE",
+        "isDefault": false,
+        "regionName": "Örebro",
+        "regionPriceId": "1",
+        "priceHasZeroVat": false
+      }
+    },
+    "regionsPrices": {
+      "1": {
+        "currentPrice": {
+          "price": 29.9,
+          "hasVat": true,
+          "endDate": "2026-11-22T22:59:59Z",
+          "hasStar": true,
+          "basePrice": {
+            "text": "79,73 kr/kg",
+            "prefix": false
+          },
+          "packaging": {
+            "text": "375 g"
+          },
+          "startDate": "2026-11-03T08:21:40.262Z",
+          "priceTheme": "white_red",
+          "currencyCode": "SEK",
+          "currencySymbol": "kr",
+          "endDateExclusive": "2026-11-22T23:00Z",
+          "variantsHaveDifferentPrices": false
+        }
+      }
+    },
+    "productId": 12178463,
+    "keyfacts": {
+      "title": "Chips Dill & Gräslök Maxipack",
+      "fullTitle": "Chips Dill & Gräslök Maxipack",
+      "moreDetails": "Ytterligare detaljer",
+      "analyticsCategory": "Food",
+      "wonCategoryPrimary": "Världar i nöd/Mat och nära mat/Godis & snacks/Smakrika snacks",
+      "wonCategoryPrimaryPath": "0/17/1744/174411"
+    },
+    "fullTitle": "Chips Dill & Gräslök Maxipack",
+    "title": "Chips Dill & Gräslök Maxipack",
+    "image": "https://www.lidl.se/assets/gcpef06a40ae04e4c43b418678aa54f6e7d.png",
+    "canonicalUrl": "/p/chips-dill-graslok-maxipack/p12178463",
+    "canonicalPath": "/p/chips-dill-graslok-maxipack/p12178463"
+  }
+]
